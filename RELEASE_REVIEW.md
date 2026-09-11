@@ -26,7 +26,7 @@ Cargo audit 0.22.2 使用 RustSec advisory database commit `b50980aad8b8f14f77e2
 
 部分 crates 未隨套件附帶獨立 LICENSE，已保留其原始 copyright / AUTHORS / README，補上其授權允許的 Apache-2.0 文本；objc2 的聲明取自套件對應的上游 commit。**objc2 上游自行記載 Apple SDK 衍生授權的不確定性，本次原文保留，沒有宣稱已解決該法律問題。** 詳見 `third-party/objc2-*/UPSTREAM-LICENSE.md`。
 
-**本專案 LICENSE 尚待使用者決定**。第三方清單不授予 Runtime Gatekeeper 本身的開源權利；目前未代選授權、未建立 GitHub repository、未發布 Release。
+**本專案 LICENSE 尚待使用者決定**。第三方清單不授予 Runtime Gatekeeper 本身的開源權利；目前未代選授權，已建立 [stereosurfer/runtime-gatekeeper](https://github.com/stereosurfer/runtime-gatekeeper) 公開原始碼 repository，但尚未發布 Release。
 
 ## 真實瀏覽器驗收
 
