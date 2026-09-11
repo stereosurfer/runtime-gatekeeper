@@ -1,0 +1,90 @@
+[
+  {
+    "name": "anyhow",
+    "version": "1.0.104",
+    "repository": "https://github.com/dtolnay/anyhow",
+    "archived": false,
+    "last_push": "2026-08-22T02:43:42Z",
+    "source": "https://api.github.com/repos/dtolnay/anyhow"
+  },
+  {
+    "name": "fs2",
+    "version": "0.4.3",
+    "repository": "https://github.com/danburkert/fs2-rs",
+    "archived": false,
+    "last_push": "2024-02-16T20:16:28Z",
+    "source": "https://api.github.com/repos/danburkert/fs2-rs"
+  },
+  {
+    "name": "libc",
+    "version": "0.2.189",
+    "repository": "https://github.com/rust-lang/libc",
+    "archived": false,
+    "last_push": "2026-09-08T20:48:51Z",
+    "source": "https://api.github.com/repos/rust-lang/libc"
+  },
+  {
+    "name": "serde",
+    "version": "1.0.229",
+    "repository": "https://github.com/serde-rs/serde",
+    "archived": false,
+    "last_push": "2026-08-25T03:53:14Z",
+    "source": "https://api.github.com/repos/serde-rs/serde"
+  },
+  {
+    "name": "serde-saphyr",
+    "version": "1.2.0",
+    "repository": "https://github.com/bourumir-wyngs/serde-saphyr",
+    "archived": false,
+    "last_push": "2026-09-09T11:21:21Z",
+    "source": "https://api.github.com/repos/bourumir-wyngs/serde-saphyr"
+  },
+  {
+    "name": "serde_json",
+    "version": "1.0.151",
+    "repository": "https://github.com/serde-rs/json",
+    "archived": false,
+    "last_push": "2026-08-08T06:50:26Z",
+    "source": "https://api.github.com/repos/serde-rs/json"
+  },
+  {
+    "name": "sysinfo",
+    "version": "0.37.2",
+    "repository": "https://github.com/GuillaumeGomez/sysinfo",
+    "archived": false,
+    "last_push": "2026-09-08T22:09:24Z",
+    "source": "https://api.github.com/repos/GuillaumeGomez/sysinfo"
+  },
+  {
+    "name": "tempfile",
+    "version": "3.27.0",
+    "repository": "https://github.com/Stebalien/tempfile",
+    "archived": false,
+    "last_push": "2026-09-05T17:21:42Z",
+    "source": "https://api.github.com/repos/Stebalien/tempfile"
+  },
+  {
+    "name": "tiny_http",
+    "version": "0.12.0",
+    "repository": "https://github.com/tiny-http/tiny-http",
+    "archived": false,
+    "last_push": "2024-08-14T21:18:34Z",
+    "source": "https://api.github.com/repos/tiny-http/tiny-http"
+  },
+  {
+    "name": "ureq",
+    "version": "2.12.1",
+    "repository": "https://github.com/algesten/ureq",
+    "archived": false,
+    "last_push": "2026-09-10T07:27:05Z",
+    "source": "https://api.github.com/repos/algesten/ureq"
+  },
+  {
+    "name": "uuid",
+    "version": "1.26.1",
+    "repository": "https://github.com/uuid-rs/uuid",
+    "archived": false,
+    "last_push": "2026-09-10T00:29:36Z",
+    "source": "https://api.github.com/repos/uuid-rs/uuid"
+  }
+]

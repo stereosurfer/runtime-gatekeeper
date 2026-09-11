@@ -1,0 +1,19 @@
+[package]
+name = "runtime-gatekeeper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = { version = "1.2", default-features = false, features = ["deserialize"] }
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+tiny_http = "0.12"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

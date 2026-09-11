@@ -1,0 +1,17 @@
+[
+  {
+    "check": "codesign --verify --strict --verbose=2",
+    "exit_code": 0,
+    "output": "outputs/runtime-gatekeeper/bin/runtime-gatekeeper: valid on disk\noutputs/runtime-gatekeeper/bin/runtime-gatekeeper: satisfies its Designated Requirement\n"
+  },
+  {
+    "check": "codesign -dv",
+    "exit_code": 0,
+    "output": "Executable=<WORKSPACE>/outputs/runtime-gatekeeper/bin/runtime-gatekeeper\nIdentifier=runtime_gatekeeper-3ceabc39f7712d0d\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=24520 flags=0x20002(adhoc,linker-signed) hashes=762+0 location=embedded\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements=none\n"
+  },
+  {
+    "check": "spctl --assess --type execute --verbose=4",
+    "exit_code": 3,
+    "output": "outputs/runtime-gatekeeper/bin/runtime-gatekeeper: rejected\n"
+  }
+]

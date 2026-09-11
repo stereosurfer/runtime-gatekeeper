@@ -1,0 +1,24 @@
+# All sizes are bytes. No production service is adopted or started by this example.
+port: 47831
+state_dir: .runtime
+safety_margin_bytes: 2147483648
+services:
+  demo-worker:
+    mode: managed
+    command: ["@self", "fixture", "47990"]
+    port: 47990
+    memory_bytes: 67108864
+    disposable: true
+    allowed_actions: [start, stop, restart]
+    startup_timeout_ms: 3000
+  omlx:
+    mode: discovered
+    port: 8001
+    # Set exact match_executable and match_args after verifying your install.
+    # A port-only match shows availability; RAM stays unattributed (Unknown).
+  lmstudio:
+    mode: discovered
+    port: 1234
+  comfyui:
+    mode: discovered
+    port: 8188

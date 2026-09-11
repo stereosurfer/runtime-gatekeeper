@@ -1,0 +1,8 @@
+{
+  "remaining_gatekeeper_processes": [],
+  "test_ports_listening": {
+    "47831": false,
+    "47990": false
+  },
+  "scope": "Only test-owned daemon/workers; no production services controlled"
+}

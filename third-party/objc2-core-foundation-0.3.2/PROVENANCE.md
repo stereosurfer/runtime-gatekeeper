@@ -1,0 +1,1 @@
+Upstream licensing note from https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md (crate source commit). Apache-2.0 alternative selected. Upstream Apple SDK derivation caveat retained; not independently resolved by this audit.
