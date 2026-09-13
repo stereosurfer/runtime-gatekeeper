@@ -17,6 +17,15 @@ use std::{
 };
 use sysinfo::{Pid, System};
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pid_rusage(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        buffer: *mut libc::c_void,
+    ) -> libc::c_int;
+}
+
 struct Owned {
     child: Child,
     start_time: u64,
@@ -36,6 +45,50 @@ pub fn port_open(port: u16) -> bool {
     )
     .is_ok()
 }
+
+#[cfg(target_os = "macos")]
+fn macos_phys_footprint(pid: u32) -> Option<u64> {
+    // rusage_info_v4 is 296 bytes on macOS. The phys_footprint field follows
+    // the 16-byte UUID and seven u64 counters (offset 72).
+    let mut usage = [0u8; 296];
+    let rc = unsafe {
+        proc_pid_rusage(
+            pid as libc::c_int,
+            4, // RUSAGE_INFO_V4
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let bytes: [u8; 8] = usage[72..80].try_into().ok()?;
+    let footprint = u64::from_ne_bytes(bytes);
+    (footprint > 0).then_some(footprint)
+}
+
+fn measured_memory(pid: u32, resident_bytes: u64) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        macos_phys_footprint(pid).unwrap_or(resident_bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        resident_bytes
+    }
+}
+
+fn process_memory_basis() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macOS phys_footprint (含 Metal/IOAccelerator；讀取失敗時退回 RSS)"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "RSS"
+    }
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
@@ -132,7 +185,7 @@ impl Engine {
                 name: p.name().to_string_lossy().into(),
                 executable: p.exe().map(|p| p.to_path_buf()),
                 args: p.cmd().iter().map(|s| s.to_string_lossy().into()).collect(),
-                ram_bytes: p.memory(),
+                ram_bytes: measured_memory(pid.as_u32(), p.memory()),
                 cpu_percent: p.cpu_usage(),
                 service: None,
                 class: "unknown".into(),
@@ -216,7 +269,7 @@ impl Engine {
         let unknown_processes: Vec<_> = ps.iter().filter(|p| p.service.is_none()).collect();
         let unknown_process_ram = unknown_processes.iter().map(|p| p.ram_bytes).sum::<u64>();
         let system_unaccounted = self.system.used_memory().saturating_sub(process_total);
-        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"total":self.system.total_memory(),"used":self.system.used_memory(),"available":self.system.available_memory(),"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
+        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"total":self.system.total_memory(),"used":self.system.used_memory(),"available":self.system.available_memory(),"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted,"process_basis":process_memory_basis()},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
     }
     fn action_allowed(&self, id: &str, action: &str) -> Result<Service> {
         let s = self.config.services.get(id).context("unknown service")?;

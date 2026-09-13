@@ -154,8 +154,8 @@ Agent ─ stdio MCP bridge ─┐
 Human ─ Web Dashboard ───┘                      │
                          registry / leases / memory gate
                             │                 │
-                         sysinfo          supervisor
-                     CPU RAM swap PID     owned Child + process group
+                    sysinfo + macOS       supervisor
+                  phys_footprint API     owned Child + process group
                             │                 │
                          runtime.yaml / state.json / events.jsonl
 ```
@@ -175,7 +175,7 @@ Human ─ Web Dashboard ───┘                      │
 
 ## 已知 MVP 限制
 
-- 使用 sysinfo 的 macOS 系統 / 程序記憶體指標；程序 RAM 聚合不等於 Activity Monitor / unified memory 的精確實體總占用，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
+- 系統總量與可用量來自 sysinfo；macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
 - 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、依賴 DAG、輸出目錄準備或持續健康輪詢。觀察在 status/request 時刷新；面板每 5 秒刷新。
 - 控制操作序列執行，啟動 health 等待期間面板更新可能延遲。本機 HTTP 未提供抗惡意慢連線的服務品質保證。
 - 不支援服務逃離 process group、root 退出後持續工作的 daemonized 子程序。此類程序退為觀察，需人類處理。macOS PID/start-time 檢查可降低誤殺風險，不能提供 kernel pidfd 等級的無競態保證。
