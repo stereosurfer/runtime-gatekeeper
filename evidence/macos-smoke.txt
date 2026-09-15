@@ -1,0 +1,1 @@
+PASS: macOS 27.0 26A428; launchd, HTTP, token and status are healthy

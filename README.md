@@ -29,6 +29,18 @@ daemon 在前景運行，只監聽 `127.0.0.1:47831`。開啟它在終端顯示�
 
 本機工具鏈已隔離安裝在本次工作的 `work/toolchain`，沒有修改全域 PATH。此工作目錄可用 `./dev.sh test --locked`、`./dev.sh build --release --locked` 重建；移到別處則使用 PATH 上的 Rust。
 
+## macOS 27 相容性
+
+本版保留 Rust daemon、MCP bridge 與 loopback Dashboard 的架構，沒有依賴 macOS 27 專屬 UI 或私有 framework。Apple Silicon 的程序用量由獨立的 macOS platform module 讀取 `phys_footprint`，失敗時退回 RSS；這讓 Metal / IOAccelerator 服務仍能被觀察，也保留較舊 macOS 的相容路徑。
+
+macOS 27 的 launchd 不再載入帶有 `com.apple.quarantine` extended attribute 的 plist。從 GitHub 下載後若要安裝 user LaunchAgent，請先確認檔案來源，再清除該 plist 的 quarantine；本機 `open-panel.sh` 會在載入前檢查並給出指令，不會靜默繞過 Gatekeeper。現有部署可用以下唯讀檢查驗證 launchd、HTTP、token 與 `/api/status`：
+
+```sh
+./scripts/macos-smoke.sh
+```
+
+可用 `RUNTIME_GATEKEEPER_DIR`、`RUNTIME_GATEKEEPER_LABEL` 與 `RUNTIME_GATEKEEPER_PORT` 覆寫預設的 user deployment 路徑、label 和 port。
+
 ## MCP 接法
 
 每個 Agent 啟動輕量 **stdio bridge**，連到同一 daemon。所有 Agent 和 Dashboard 共用同一份序列化狀態與 lease，避免多個 MCP server 各自啟動相同服務。MCP 使用逐行 JSON-RPC；stdout 只有協定訊息，錯誤寫 stderr。
@@ -190,6 +202,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 node tests/dashboard.mjs # 可選 Node.js，僅驗證面板；執行服務不需要 Node
+./scripts/macos-smoke.sh # macOS user LaunchAgent 的唯讀相容性檢查
 ```
 
 整合測試使用獨立暫存目錄與隨機 loopback ports，實際啟停內建 fixture，不觸碰本機 AI 服務。包含：記憶體邊界、discovered 設定拒絕、共享租約、request 冪等、受保護 stop/restart、release/cleanup、外部 port 不接管、部分啟動 rollback、stdio MCP handshake、Host/Origin/token 邊界、daemon 重啟保留租約、健康 timeout、job_id 衝突。

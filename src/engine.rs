@@ -1,4 +1,5 @@
 use crate::model::*;
+use crate::platform::{measured_memory, process_memory_basis};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -16,15 +17,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Pid, System};
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn proc_pid_rusage(
-        pid: libc::c_int,
-        flavor: libc::c_int,
-        buffer: *mut libc::c_void,
-    ) -> libc::c_int;
-}
 
 struct Owned {
     child: Child,
@@ -44,49 +36,6 @@ pub fn port_open(port: u16) -> bool {
         Duration::from_millis(100),
     )
     .is_ok()
-}
-
-#[cfg(target_os = "macos")]
-fn macos_phys_footprint(pid: u32) -> Option<u64> {
-    // rusage_info_v4 is 296 bytes on macOS. The phys_footprint field follows
-    // the 16-byte UUID and seven u64 counters (offset 72).
-    let mut usage = [0u8; 296];
-    let rc = unsafe {
-        proc_pid_rusage(
-            pid as libc::c_int,
-            4, // RUSAGE_INFO_V4
-            usage.as_mut_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let bytes: [u8; 8] = usage[72..80].try_into().ok()?;
-    let footprint = u64::from_ne_bytes(bytes);
-    (footprint > 0).then_some(footprint)
-}
-
-fn measured_memory(pid: u32, resident_bytes: u64) -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        macos_phys_footprint(pid).unwrap_or(resident_bytes)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = pid;
-        resident_bytes
-    }
-}
-
-fn process_memory_basis() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "macOS phys_footprint (含 Metal/IOAccelerator；讀取失敗時退回 RSS)"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "RSS"
-    }
 }
 
 impl Engine {

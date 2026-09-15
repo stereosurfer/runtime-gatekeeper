@@ -1,6 +1,6 @@
 # Runtime Gatekeeper · 發布前驗收
 
-日期：2026-09-10。結論：**本機 MVP 功能驗收通過；公開發布準備仍為 PARTIAL**。
+日期：2026-09-16。結論：**本機 MVP 功能驗收通過；公開發布準備仍為 PARTIAL**。
 
 ## 本次修正
 
@@ -10,12 +10,14 @@
 4. 斷線資料明確標示為上次快照；重新連線成功時清除過期錯誤提示。
 5. 清理部分失敗顯示未停止的服務與原因，不再以處理數掩蓋失敗。
 6. macOS Apple Silicon 程序記憶體改用 `phys_footprint`，把 Metal / IOAccelerator 圖形記憶體納入服務聚合；讀取失敗時退回 RSS。
+7. macOS 記憶體讀取移至獨立 platform module；加入 macOS 27 launchd quarantine preflight 與 user deployment smoke test。
 
 ## 自動驗證
 
-- Rust：13 tests passed / 0 failed（2 unit + 11 integration），見 `evidence/rust-tests.txt`。
+- Rust：14 tests passed / 0 failed（3 unit + 11 integration）。
 - `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、release build 通過。
 - `node tests/dashboard.mjs` 通過：真實嵌入 JavaScript 搭配受控 transport，驗證 pending/duplicate、partial cleanup failure、offline、expired token、storage fault、reconnect。這是 UI 邏輯測試，不冒充真實瀏覽器。
+- `scripts/macos-smoke.sh`：**PASS**，macOS 27.0 build 26A428；launchd、HTTP、token、`/api/status` 與 quarantine 檢查通過。
 - Rust 實際啟停測試含共享租約、並行 request 僅啟動一次、部分失敗不停止既有共享服務、健康 timeout、rollback 寫入失敗、程序意外退出、重複 daemon、state 損毀、Host/Origin/token、MCP stdio。
 - rollback 寫入失敗測試確認：不回 READY；存活程序仍可觀察；後續控制停用。測試自己的殘留 fixture 經確認後清理。
 
@@ -64,4 +66,4 @@ Cargo audit 0.22.2 使用 RustSec advisory database commit `b50980aad8b8f14f77e2
 
 ## 最終交付與清理
 
-最終 ZIP 已驗證壓縮完整性、解壓後執行權限、binary byte identity、設定驗證及 HTTP 面板載入；新版重新認證成功後已在真實瀏覽器確認舊錯誤提示消失。個人絕對路徑與 state/token/target 排除掃描通過。主機程序檢查與 TCP 檢查確認 47831 / 47990 不再監聽、無 Runtime Gatekeeper 程序；in-app browser 測試分頁為空，未操作 Chrome profile。見 `evidence/cleanup.json`。
+最終 ZIP 已驗證壓縮完整性、解壓後執行權限、binary byte identity、設定驗證及 HTTP 面板載入；新版重新認證成功後已在真實瀏覽器確認舊錯誤提示消失。個人絕對路徑與 state/token/target 排除掃描通過。公開 repository 不包含本機 state、token、LaunchAgent 或私有 runtime.yaml；本機 user deployment 的目前狀態由 `scripts/macos-smoke.sh` 另行驗證。

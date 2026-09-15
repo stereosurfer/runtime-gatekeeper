@@ -2,11 +2,12 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
      Running unittests src/main.rs (<WORKSPACE>/work/runtime-gatekeeper-target/debug/deps/runtime_gatekeeper-5db537972ab2efd8)
 
-running 2 tests
+running 3 tests
 test model::tests::deterministic_gate_boundaries ... ok
+test platform::tests::reports_a_non_empty_memory_basis ... ok
 test model::tests::reject_discovered_control ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests/mvp.rs (<WORKSPACE>/work/runtime-gatekeeper-target/debug/deps/mvp-8da53f48b6f04af6)
 
@@ -24,4 +25,3 @@ test concurrent_requests_start_once_and_failed_batch_preserves_shared_service ..
 test lifecycle_shared_leases_and_blocked_resources ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
-
