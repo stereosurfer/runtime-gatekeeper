@@ -43,6 +43,8 @@ macOS 27 的 launchd 不再載入帶有 `com.apple.quarantine` extended attribut
 
 ## MCP 接法
 
+Agent 的設定方式、request / release 範本、READY 與阻擋回覆處理、安全界線，請先讀 [Agent MCP 操作指南](docs/AGENT_MCP_GUIDE.md)。
+
 每個 Agent 啟動輕量 **stdio bridge**，連到同一 daemon。所有 Agent 和 Dashboard 共用同一份序列化狀態與 lease，避免多個 MCP server 各自啟動相同服務。MCP 使用逐行 JSON-RPC；stdout 只有協定訊息，錯誤寫 stderr。
 
 在支援 MCP 的客戶端填入以下設定（替換兩個絕對路徑）：
