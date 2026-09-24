@@ -71,7 +71,7 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
 
 ## Agent 呼叫範本
 
-先取得工作流程已核准的 service ID、Agent 名稱和唯一 `job_id`。`requires` 必填且不可為空；`memory_bytes` 可省略，若提供，代表**額外工作記憶體**，單位是 bytes，不是服務總 RAM。不要自行估算或填入未經工作定義提供的需求。
+先取得工作流程已核准的 service ID、Agent 名稱和唯一 `job_id`。`requires` 必填且不可為空；Gatekeeper 會依目前設定自動展開服務相依，回傳 `expanded_requires`。`memory_bytes` 可省略，若提供，代表**經量測的額外工作記憶體**，單位是 bytes，不是服務總 RAM。不要自行估算或填入未經工作定義提供的需求。
 
 ```json
 {
@@ -87,11 +87,11 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
 
 ### `READY`
 
-工作可以開始。保存 `runtime_id`，不要因每個後續子步驟或工具呼叫再次 request。Agent 不必再逐一確認 service、process 或 port。
+工作可以開始。保存 `runtime_id`，不要因每個後續子步驟或工具呼叫再次 request。Gatekeeper 已核對監聽程序身分及設定的 HTTP 健康路徑；專項技能仍需核對模型、節點與輸出。若回覆 `memory_assurance: unknown`，READY 只代表互斥與目前可核對的准入條件成立，**不保證未量測的生成容量**。
 
 ### `BLOCKED_RESOURCE`
 
-以結果內的原始值回報使用者：
+先讀 `resource`。若為 `memory`，以結果內的原始值回報使用者：
 
 - `required`：本次額外需求，bytes。
 - `available`：扣除安全保留量及現有估算後可供本次准入的量，bytes。
@@ -101,9 +101,11 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
 
 可將 bytes 換算成易讀單位，但同時保留原始數值與 service ID。不要只說「記憶體不夠」，也不要推測某個服務可以犧牲。資源狀態變更由使用者在 Dashboard 或自行管理後，Agent 才以同一 `job_id`、同一 arguments 重試。
 
+若 `resource` 是 `exclusive_group`，回報 `protected` 中的工作與同組名稱；這表示另一筆重型工作持有租約，不表示記憶體數值不足。若為 `unknown_service_startup_memory`，回報尚未量測的 managed 服務 ID，待管理員補入經量測的啟動估計。這兩種回覆沒有 `shortfall` 數值，不要編造。
+
 ### `BLOCKED_SERVICE`
 
-回報 `unavailable`、`service`、`reason` 及 `rollback`（若回傳）。常見原因是 discovered 服務尚未運行、埠口健康檢查失敗，或 managed 服務啟動失敗。discovered 服務只能觀察，Gatekeeper 不會接管或啟動外部程序。
+回報 `unavailable`、`service`、`reason` 及 `rollback`（若回傳）。常見原因是 discovered 服務尚未運行、監聽埠並非已登錄程序所有、HTTP 健康路徑失敗，或 managed 服務啟動失敗。discovered 服務只能觀察，Gatekeeper 不會接管或啟動外部程序。
 
 ### MCP 工具錯誤
 

@@ -15,7 +15,7 @@ services:
     mode: discovered
     port: 8001
     # Set exact match_executable and match_args after verifying your install.
-    # A port-only match shows availability; RAM stays unattributed (Unknown).
+    # Port-only entries remain unverified and cannot satisfy runtime.request.
   lmstudio:
     mode: discovered
     port: 1234

@@ -25,7 +25,13 @@ pub struct Service {
     pub match_args: Vec<String>,
     pub port: Option<u16>,
     #[serde(default)]
-    pub memory_bytes: u64,
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub http_health_path: Option<String>,
+    #[serde(default)]
+    pub exclusive_group: Option<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
     #[serde(default)]
     pub disposable: bool,
     #[serde(default)]
@@ -88,8 +94,67 @@ impl Config {
             if let Some(p) = &s.match_executable {
                 ensure!(p.is_absolute(), "match_executable must be absolute");
             }
+            if let Some(path) = &s.http_health_path {
+                ensure!(
+                    s.port.is_some()
+                        && path.starts_with('/')
+                        && !path.chars().any(char::is_whitespace),
+                    "http_health_path requires a port and a single HTTP path"
+                );
+            }
+            if let Some(group) = &s.exclusive_group {
+                ensure!(
+                    !group.is_empty()
+                        && group
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)),
+                    "invalid exclusive_group for {id}"
+                );
+            }
+            for dependency in &s.requires {
+                ensure!(
+                    dependency != id && self.services.contains_key(dependency),
+                    "invalid dependency {dependency} for {id}"
+                );
+            }
+        }
+        for id in self.services.keys() {
+            self.expand_requires(&[id.clone()])?;
         }
         Ok(())
+    }
+
+    pub fn expand_requires(&self, requested: &[String]) -> Result<Vec<String>> {
+        fn visit(
+            id: &str,
+            config: &Config,
+            visiting: &mut BTreeSet<String>,
+            complete: &mut BTreeSet<String>,
+        ) -> Result<()> {
+            ensure!(
+                config.services.contains_key(id),
+                "unknown required service: {id}"
+            );
+            if complete.contains(id) {
+                return Ok(());
+            }
+            ensure!(
+                visiting.insert(id.to_owned()),
+                "service dependency cycle at {id}"
+            );
+            for next in &config.services[id].requires {
+                visit(next, config, visiting, complete)?;
+            }
+            visiting.remove(id);
+            complete.insert(id.to_owned());
+            Ok(())
+        }
+        let mut visiting = BTreeSet::new();
+        let mut complete = BTreeSet::new();
+        for id in requested {
+            visit(id, self, &mut visiting, &mut complete)?;
+        }
+        Ok(complete.into_iter().collect())
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +165,7 @@ pub struct Request {
     pub requires: Vec<String>,
     /// Additional job memory, beyond the incremental service startup estimates.
     #[serde(default)]
-    pub memory_bytes: u64,
+    pub memory_bytes: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {

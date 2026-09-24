@@ -72,7 +72,7 @@ Agent 的設定方式、request / release 範本、READY 與阻擋回覆處理�
 }
 ```
 
-一次 request 會檢查所有需求、資源、啟動與 port readiness，最後回傳 `runtime_id`。使用相同 job_id 與相同內容重試具冪等性，不新增租約、不重複啟動。不同內容使用同一 job_id 回 `JOB_CONFLICT`。BLOCKED 可用原 request 重試；RELEASED 的工作需使用新 job_id。READY 重試會再檢查服務健康，不會掩蓋服務已退出的情況。
+一次 request 會展開服務相依，檢查監聽程序身分、可選的 HTTP 健康路徑、同組工作租約與已量測的記憶體需求，最後回傳 `runtime_id`。使用相同 job_id 與相同內容重試具冪等性，不新增租約、不重複啟動。不同內容使用同一 job_id 回 `JOB_CONFLICT`。BLOCKED 可用原 request 重試；RELEASED 的工作需使用新 job_id。READY 重試會再檢查服務健康，不會掩蓋服務已退出的情況。
 
 工作完成後：
 
@@ -98,7 +98,7 @@ release 只解除租約，不停止共享服務。若要回收可丟棄的閒置
 
 MCP 提供 initialize、ping、tools/list、tools/call，支援 2024-11-05、2025-06-18、2025-11-25 協定版本；未知版本回覆 2025-06-18，由客戶端決定是否相容。不提供 resources、prompts、訂閱、串流通知或 HTTP MCP transport。`/rpc` 是內部受保護的 bridge API，不宣稱為 MCP Streamable HTTP。
 
-參照：[MCP tools 規格](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)、[sysinfo API](https://docs.rs/sysinfo/0.37.2/sysinfo/struct.System.html)。
+參照：[MCP tools 規格](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)、[sysinfo API](https://docs.rs/sysinfo/0.37.2/sysinfo/struct.System.html)。新增服務前先讀 [服務登錄與回復流程](docs/SERVICE_REGISTRATION.md)。
 
 ## 靜態設定
 
@@ -116,7 +116,10 @@ services:
     match_executable: /absolute/venv/bin/python
     match_args: [/absolute/service/server.py]
     port: 47991
+    http_health_path: /health
     memory_bytes: 4294967296
+    exclusive_group: media-heavy
+    requires: []
     disposable: true
     allowed_actions: [start, stop, restart]
     startup_timeout_ms: 10000
@@ -125,8 +128,10 @@ services:
 - `command` 是 executable + argv，直接 spawn，不經 shell；executable 必須絕對路徑，`@self` 是內建 demo 用的目前執行檔。
 - 服務必須以前景模式執行，子程序留在專屬 process group。不要用 daemonize、`launchctl`、`brew services` 或會背景化的 wrapper；本版不接管這類程序。
 - `match_executable` 是 OS 回報的完整 executable path；virtualenv symlink 可能回報實體 interpreter，需以實際狀態確認。`match_args` 每一項都需精確匹配某個 argv。多個定義同時匹配時不猜測歸屬。
-- `mode: discovered` 不可設 command、allowed_actions 或 disposable。port-only 可觀察服務是否有 listener，但 RAM 在 API 為 0、面板顯示未歸屬，不把任意同名 Python 計入服務。
-- `port` 可省略，此時 READY 只表示程序通過短暫存活檢查；有 port 時代表 TCP 可連，不代表模型已載入、HTTP API 正確或工作已完成。
+- `mode: discovered` 不可設 command、allowed_actions 或 disposable。帶有 port 的服務必須由精確的執行檔／參數辨識到程序，且該程序（或其明確子程序）確實持有監聽 socket；只知道 port 可連時狀態為 unhealthy，不能取得 READY。socket 歸屬探針失敗也採保守阻擋。
+- `http_health_path` 可選；指定後，Gatekeeper 還會對 loopback 端點要求 HTTP 2xx。未指定時只有 socket 身分和 TCP 判定。這不證明模型、節點或整個工作流可用，專項工作仍須檢查。
+- `exclusive_group` 讓同組服務的不同工作一次只能有一筆 READY／INTERRUPTED 租約；不停止既有工作。`requires` 是服務相依，request 會自動展開並保存在工作收據中，例如 Director 引擎可要求 Director UI。設定須避免循環。
+- `port` 可省略，此時 READY 只表示已辨識程序通過短暫存活檢查；沒有端點就不能做 HTTP 就緒檢查。
 - timeout 為 100–60000 ms；port 不可重複；服務 id 限英數字、`-`、`_`。
 
 ## 記憶體判定
@@ -141,7 +146,7 @@ available = max(OS available - safety_margin - outstanding, 0)
 shortfall = max(required - available, 0)
 ```
 
-`memory_bytes` 是**額外工作需求**，不是包括共享服務在內的總 RAM。運行中的共享服務不重複計算啟動 RAM。現有 job 額外需求持續保守扣除至 release，因此可能重複涵蓋已實際使用的部分，寧可保守阻擋。這是簡單 admission accounting，沒有排程、優先權、資源搶占或 OS 記憶體保留；外部程序仍可能在 READY 後消耗 RAM。
+`memory_bytes` 是**額外工作需求**，不是包括共享服務在內的總 RAM。未填值保持 `null`，回覆的 `memory_assurance: unknown` 與 `unmeasured_job_memory: true` 明示容量未知；即使其他條件得到 READY，也不能將 0 當作量測結果。未量測的 managed 服務啟動會以 `unknown_service_startup_memory` 阻擋。運行中的共享服務不重複計算啟動 RAM。現有已量測 job 額外需求持續保守扣除至 release。這是簡單 admission accounting，沒有排程、優先權、資源搶占或 OS 記憶體保留；外部程序仍可能在 READY 後消耗 RAM。
 
 ```json
 {
@@ -185,7 +190,7 @@ Human ─ Web Dashboard ───┘                      │
 - daemon 重啟時，舊 READY 工作標為 INTERRUPTED 並保留租約。舊 PID 不恢復控制權；需確認工作後 release，再決定如何處理外部程序。程序自行退出不會自動重啟。
 - state directory 使用 0700，token、state、事件與 log 使用 0600；state.json 以暫存檔 + rename 更新，事件 append JSONL。單一 state_dir 的檔案鎖阻擋第二個 daemon。
 - HTTP 只綁 loopback，API 需 bearer token，檢查 Host / Origin，不開 CORS。Dashboard token 由 URL fragment 讀入 sessionStorage，隨即移除 fragment。UI 控制需人類確認。資料使用 textContent 呈現，無外部資產。
-- 本版為受信任的單一 macOS 帳號使用；不是惡意本機使用者隔離、安全沙箱或高可用 supervisor。TCP health 存在檢查與使用時間差，不能驗證 listener 是某一模型。不要暴露 port、轉發代理或共用 token。
+- 本版為受信任的單一 macOS 帳號使用；不是惡意本機使用者隔離、安全沙箱或高可用 supervisor。監聽程序身分及 HTTP 健康檢查與實際使用之間仍有時間差，不能證明某一模型已載入。不要暴露 port、轉發代理或共用 token。
 
 ## 已知 MVP 限制
 

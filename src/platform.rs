@@ -1,4 +1,38 @@
 //! Small operating-system adapters kept outside the runtime engine.
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::Command,
+};
+
+/// Return the owner PIDs of TCP listeners. None means the ownership probe
+/// failed, which callers must treat as unverified rather than as an open port.
+pub fn listening_pids() -> Option<BTreeMap<u16, BTreeSet<u32>>> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut result: BTreeMap<u16, BTreeSet<u32>> = BTreeMap::new();
+    let mut pid = None;
+    for line in String::from_utf8(output.stdout).ok()?.lines() {
+        match line.chars().next() {
+            Some('p') => pid = line[1..].parse::<u32>().ok(),
+            Some('n') => {
+                let Some(owner) = pid else { continue };
+                let Some((_, port)) = line[1..].rsplit_once(':') else {
+                    continue;
+                };
+                if let Ok(port) = port.parse::<u16>() {
+                    result.entry(port).or_default().insert(owner);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(result)
+}
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {

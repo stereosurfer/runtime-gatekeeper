@@ -1,13 +1,13 @@
 use crate::model::*;
-use crate::platform::{measured_memory, process_memory_basis};
+use crate::platform::{listening_pids, measured_memory, process_memory_basis};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::{SocketAddr, TcpStream},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
@@ -36,6 +36,27 @@ pub fn port_open(port: u16) -> bool {
         Duration::from_millis(100),
     )
     .is_ok()
+}
+fn http_ready(port: u16, path: &str) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    if write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut response = [0u8; 64];
+    let Ok(n) = stream.read(&mut response) else {
+        return false;
+    };
+    response[..n].starts_with(b"HTTP/1.1 2") || response[..n].starts_with(b"HTTP/1.0 2")
 }
 
 impl Engine {
@@ -198,17 +219,24 @@ impl Engine {
         rows
     }
     fn views(&self, processes: &[Process]) -> Vec<Value> {
+        let listeners = listening_pids();
         self.config.services.iter().map(|(id,s)| {
             let ps:Vec<_>=processes.iter().filter(|p|p.service.as_ref()==Some(id)).collect();
-            let healthy=s.port.map(port_open);
-            let class=if self.owned.contains_key(id) {"managed"} else if !ps.is_empty() || healthy==Some(true) {"discovered"} else if s.mode==Mode::Managed {"managed"} else {"discovered"};
+            let port_reachable=s.port.is_some_and(port_open);
+            let identity_verified=s.port.map(|port| listeners.as_ref()
+                .and_then(|map|map.get(&port))
+                .is_some_and(|owners|ps.iter().any(|p|owners.contains(&p.pid))));
+            let healthy=s.port.map(|port| port_reachable && identity_verified==Some(true)
+                && s.http_health_path.as_ref().is_none_or(|path|http_ready(port,path)));
+            let class=if self.owned.contains_key(id) || (s.mode==Mode::Managed && ps.is_empty()) {"managed"} else {"discovered"};
             let leases=self.leases(id);
-            let running=!ps.is_empty() || healthy==Some(true);
+            let running=if s.port.is_some() {healthy==Some(true)} else {!ps.is_empty()};
+            let state=if running {"running"} else if port_reachable || !ps.is_empty() {"unhealthy"} else {"stopped"};
             let mut actions=Vec::new();
             if s.mode==Mode::Managed && class=="managed" && leases.is_empty() {
                 for a in &s.allowed_actions { if (a=="start" && !running) || (a!="start" && self.owned.contains_key(id)) { actions.push(a); } }
             }
-            json!({"id":id,"class":class,"configured_mode":s.mode,"state":if running {if healthy==Some(false){"unhealthy"}else{"running"}} else {"stopped"},"healthy":healthy,"port":s.port,"ram_bytes":ps.iter().map(|p|p.ram_bytes).sum::<u64>(),"cpu_percent":ps.iter().map(|p|p.cpu_percent).sum::<f32>(),"memory_estimate_bytes":s.memory_bytes,"disposable":s.disposable,"leases":leases,"processes":ps,"actions":actions})
+            json!({"id":id,"class":class,"configured_mode":s.mode,"state":state,"healthy":healthy,"identity_verified":identity_verified,"ownership_probe_available":listeners.is_some(),"http_health_path":s.http_health_path,"exclusive_group":s.exclusive_group,"requires":s.requires,"port":s.port,"ram_bytes":ps.iter().map(|p|p.ram_bytes).sum::<u64>(),"cpu_percent":ps.iter().map(|p|p.cpu_percent).sum::<f32>(),"memory_estimate_bytes":s.memory_bytes,"disposable":s.disposable,"leases":leases,"processes":ps,"actions":actions})
         }).collect()
     }
     pub fn status(&mut self) -> Value {
@@ -287,7 +315,11 @@ impl Engine {
             if !self.owned.contains_key(id) {
                 bail!("START_FAILED: service exited (see service log)");
             }
-            if s.port.map(port_open).unwrap_or(true) {
+            let ready = self
+                .views(&self.processes())
+                .iter()
+                .any(|v| v["id"] == id && v["state"] == "running");
+            if ready {
                 self.persist("service_started", json!({"service":id}))?;
                 return Ok(());
             }
@@ -386,7 +418,9 @@ impl Engine {
             .jobs
             .values()
             .filter(|j| ["READY", "INTERRUPTED"].contains(&j.status.as_str()))
-            .fold(0u64, |n, j| n.saturating_add(j.request.memory_bytes));
+            .fold(0u64, |n, j| {
+                n.saturating_add(j.request.memory_bytes.unwrap_or(0))
+            });
         let service_pending =
             views
                 .iter()
@@ -422,6 +456,21 @@ impl Engine {
             .collect();
         json!({"status":g.status,"resource":"memory","units":"bytes","required":g.required,"available":g.available,"shortfall":g.shortfall,"observed_available":self.system.available_memory(),"safety_margin":self.config.safety_margin_bytes,"outstanding_estimates":outstanding.saturating_add(service_pending),"reclaimable":reclaimable,"protected":protected})
     }
+    fn exclusive_conflicts(&self, requested: &[String]) -> Vec<Value> {
+        let groups: BTreeSet<_> = requested
+            .iter()
+            .filter_map(|id| self.config.services[id].exclusive_group.as_deref())
+            .collect();
+        self.state.jobs.values()
+            .filter(|j| ["READY", "INTERRUPTED"].contains(&j.status.as_str()))
+            .filter_map(|j| {
+                let shared: Vec<_> = j.request.requires.iter()
+                    .filter_map(|id| self.config.services.get(id).and_then(|s| s.exclusive_group.as_deref()))
+                    .filter(|group| groups.contains(group))
+                    .collect();
+                (!shared.is_empty()).then(|| json!({"runtime_id":j.runtime_id,"job_id":j.request.job_id,"agent":j.request.agent,"status":j.status,"groups":shared}))
+            }).collect()
+    }
     pub fn request(&mut self, mut r: Request) -> Result<Value> {
         ensure!(
             !r.job_id.trim().is_empty()
@@ -431,14 +480,7 @@ impl Engine {
             "job_id and agent must be 1..128 characters"
         );
         ensure!(!r.requires.is_empty(), "requires cannot be empty");
-        r.requires.sort();
-        r.requires.dedup();
-        for id in &r.requires {
-            ensure!(
-                self.config.services.contains_key(id),
-                "unknown required service: {id}"
-            );
-        }
+        r.requires = self.config.expand_requires(&r.requires)?;
         if let Some(j) = self.state.jobs.get(&r.job_id) {
             ensure!(
                 j.request == r,
@@ -462,8 +504,9 @@ impl Engine {
         }
         self.refresh();
         let views = self.views(&self.processes());
-        let mut required = r.memory_bytes;
+        let mut required = r.memory_bytes.unwrap_or(0);
         let mut unavailable = Vec::new();
+        let mut unknown_startup = Vec::new();
         for id in &r.requires {
             let s = &self.config.services[id];
             let v = views.iter().find(|v| v["id"] == *id).unwrap();
@@ -473,9 +516,13 @@ impl Engine {
                     && s.allowed_actions.contains("start")
                     && self.leases(id).is_empty()
                 {
-                    required = required
-                        .checked_add(s.memory_bytes)
-                        .context("memory requirement overflow")?;
+                    if let Some(estimate) = s.memory_bytes {
+                        required = required
+                            .checked_add(estimate)
+                            .context("memory requirement overflow")?;
+                    } else {
+                        unknown_startup.push(id.clone());
+                    }
                 } else {
                     unavailable.push(id.clone());
                 }
@@ -487,9 +534,22 @@ impl Engine {
             .get(&r.job_id)
             .map(|j| j.runtime_id.clone())
             .unwrap_or_else(|| format!("rt-{}", uuid::Uuid::new_v4()));
+        let conflicts = self.exclusive_conflicts(&r.requires);
         let mut result = self.gate(required, &views);
+        result["memory_assurance"] = json!(if r.memory_bytes.unwrap_or(0) > 0 {
+            "estimated"
+        } else {
+            "unknown"
+        });
+        result["unmeasured_job_memory"] = json!(r.memory_bytes.unwrap_or(0) == 0);
+        result["expanded_requires"] = json!(r.requires);
+        if !conflicts.is_empty() {
+            result = json!({"status":"BLOCKED_RESOURCE","resource":"exclusive_group","protected":conflicts,"expanded_requires":r.requires});
+        } else if !unknown_startup.is_empty() {
+            result = json!({"status":"BLOCKED_RESOURCE","resource":"unknown_service_startup_memory","services":unknown_startup,"expanded_requires":r.requires});
+        }
         if !unavailable.is_empty() {
-            result = json!({"status":"BLOCKED_SERVICE","unavailable":unavailable});
+            result = json!({"status":"BLOCKED_SERVICE","unavailable":unavailable,"expanded_requires":r.requires});
         }
         if result["status"] == "READY" {
             let mut started: Vec<&str> = Vec::new();
@@ -597,8 +657,13 @@ impl Engine {
                 if action != "stop" {
                     self.refresh();
                     let views = self.views(&self.processes());
+                    let Some(estimate) = self.config.services[&id].memory_bytes else {
+                        return Ok(
+                            json!({"status":"BLOCKED_RESOURCE","resource":"unknown_service_startup_memory","service":id}),
+                        );
+                    };
                     let required = if action == "restart" {
-                        self.config.services[&id].memory_bytes.saturating_sub(
+                        estimate.saturating_sub(
                             views
                                 .iter()
                                 .find(|v| v["id"] == id)
@@ -606,7 +671,7 @@ impl Engine {
                                 .unwrap_or(0),
                         )
                     } else {
-                        self.config.services[&id].memory_bytes
+                        estimate
                     };
                     let gate = self.gate(required, &views);
                     if gate["status"] != "READY" {
