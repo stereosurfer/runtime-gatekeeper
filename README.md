@@ -134,6 +134,8 @@ services:
 - `port` 可省略，此時 READY 只表示已辨識程序通過短暫存活檢查；沒有端點就不能做 HTTP 就緒檢查。
 - timeout 為 100–60000 ms；port 不可重複；服務 id 限英數字、`-`、`_`。
 
+尚未登錄的程式若占用既有服務的埠，不會被自動接管或關閉。原服務已退出而別的程序占埠時，身分檢查會阻擋 READY；設定內重複埠會在 `check` 階段被拒絕。未登錄服務即使使用空閒埠，也沒有租約及互斥組保護。安裝前的核對與回復步驟見[服務登錄與回復流程](docs/SERVICE_REGISTRATION.md#埠衝突與尚未登錄的服務)。
+
 ## 記憶體判定
 
 全程使用整數 bytes，依固定服務 id 順序處理，同一量測快照與狀態必定得到同一結果：
@@ -180,7 +182,7 @@ Human ─ Web Dashboard ───┘                      │
 ```
 
 - **Managed**：可啟動的靜態定義；運行時只有本 daemon 持有 live Child handle 的程序可控制。
-- **Discovered**：外部啟動、精確匹配或 port 可見。即使定義為 managed，已有外部 listener 也只觀察，拒絕接管或重複啟動。
+- **Discovered**：外部啟動、由登錄的執行檔與參數辨識。若設定了 port，監聽者還必須屬於該程序或其明確子程序；只看見 port 不代表服務健康。即使定義為 managed，已有外部 listener 也只觀察，拒絕接管或重複啟動。
 - **Unknown**：未歸屬程序，僅查看。看不到的 OS 程序、受權限限制的資訊可能缺漏。
 - Dashboard 會把 Unknown 依顯示用的應用程式群組彙總（例如 Google Chrome、ChatGPT / Codex Desktop、WebKit / In-app Browser、Python / Node），並保留可展開的 PID 明細。這是閱讀用的啟發式分組，不改變服務所有權；真正的服務歸屬仍只由 `runtime.yaml` 的精確程序匹配決定。
 - Group membership 用於 daemon-owned 服務聚合，外部精確匹配後向子程序繼承歸屬；每個 PID 只計入一個服務。只顯示程序名稱、PID 與用量，不把完整 argv 送到面板。
@@ -195,7 +197,7 @@ Human ─ Web Dashboard ───┘                      │
 ## 已知 MVP 限制
 
 - 系統總量與可用量來自 sysinfo；macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
-- 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、依賴 DAG、輸出目錄準備或持續健康輪詢。觀察在 status/request 時刷新；面板每 5 秒刷新。
+- 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、跨工作排程 DAG、輸出目錄準備或持續健康輪詢。服務 `requires` 只在單筆 request 內展開；觀察在 status/request 時刷新，面板每 5 秒刷新。
 - 控制操作序列執行，啟動 health 等待期間面板更新可能延遲。本機 HTTP 未提供抗惡意慢連線的服務品質保證。
 - 不支援服務逃離 process group、root 退出後持續工作的 daemonized 子程序。此類程序退為觀察，需人類處理。macOS PID/start-time 檢查可降低誤殺風險，不能提供 kernel pidfd 等級的無競態保證。
 - JSON state 與 JSONL event 不是單一資料庫 transaction，崩潰時事件可能少最後一筆；損毀 state 會拒絕啟動，不清空租約。寫入失敗會停用後續控制操作，需修復後重啟。events / logs 尚無 rotation。
