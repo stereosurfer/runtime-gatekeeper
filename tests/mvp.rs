@@ -70,9 +70,50 @@ impl Harness {
             json!({"job_id":id,"agent":"test","requires":["demo"]}),
         )
     }
+    fn try_call(&self, name: &str, args: Value) -> Option<Value> {
+        let response: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", self.port))
+            .timeout(Duration::from_secs(3))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .send_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}))
+            .ok()?
+            .into_json()
+            .ok()?;
+        (response["result"]["isError"] == false)
+            .then(|| response["result"]["structuredContent"].clone())
+    }
+    fn stop_test_owned_services(&self) {
+        // Do not infer ownership from a reachable port or the display class.
+        // All mutations go through the isolated daemon's lease and owned-child
+        // checks while that daemon still holds its process handles.
+        let Some(status) = self.try_call("runtime.status", json!({})) else {
+            return;
+        };
+        if let Some(jobs) = status["jobs"].as_array() {
+            for job in jobs {
+                if ["READY", "INTERRUPTED"].contains(&job["status"].as_str().unwrap_or("")) {
+                    let _ =
+                        self.try_call("runtime.release", json!({"runtime_id":job["runtime_id"]}));
+                }
+            }
+        }
+        let _ = self.try_call("runtime.cleanup", json!({}));
+        if let Some(status) = self.try_call("runtime.status", json!({}))
+            && let Some(services) = status["services"].as_array()
+        {
+            for service in services {
+                if service["actions"]
+                    .as_array()
+                    .is_some_and(|actions| actions.contains(&json!("stop")))
+                {
+                    let _ = self.try_call("services.stop", json!({"service_id":service["id"]}));
+                }
+            }
+        }
+    }
 }
 impl Drop for Harness {
     fn drop(&mut self) {
+        self.stop_test_owned_services();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -174,7 +215,31 @@ fn external_listener_is_never_adopted_or_stopped() {
         true
     );
     h.call("runtime.cleanup", json!({}));
+    drop(h);
     assert!(listener.local_addr().is_ok());
+}
+
+#[test]
+fn harness_drop_releases_owned_fixture_before_stopping_daemon() {
+    let service_port;
+    {
+        let h = Harness::new();
+        service_port = h.service_port;
+        assert_eq!(h.request("drop-cleanup")["status"], "READY");
+        // Deliberately leave the READY lease for the test harness to release.
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", service_port)) {
+            drop(listener);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test fixture survived Harness::drop"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 #[test]
 fn failure_rolls_back_new_services_and_does_not_lease() {
