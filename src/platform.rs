@@ -72,6 +72,20 @@ pub fn process_memory_basis() -> &'static str {
     }
 }
 
+/// Conservative admission input when sysinfo's macOS available-memory formula
+/// saturates at zero. Its free-memory value excludes speculative pages and
+/// therefore counts only currently unused physical pages; it is not a claim
+/// about reclaimable inactive pages or future allocations.
+pub fn admission_available_memory(sysinfo_available: u64, free_memory: u64) -> (u64, &'static str) {
+    #[cfg(target_os = "macos")]
+    if sysinfo_available == 0 && free_memory > 0 {
+        return (free_memory, "macos_free_pages_fallback");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = free_memory;
+    (sysinfo_available, "sysinfo_available")
+}
+
 #[cfg(target_os = "macos")]
 fn macos_phys_footprint(pid: u32) -> Option<u64> {
     // rusage_info_v4 is 296 bytes on macOS. The phys_footprint field follows
@@ -105,5 +119,33 @@ mod tests {
     #[test]
     fn reports_a_non_empty_memory_basis() {
         assert!(!process_memory_basis().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_uses_only_free_pages_when_sysinfo_available_saturates() {
+        use super::admission_available_memory;
+        use crate::model::memory_gate;
+
+        assert_eq!(
+            admission_available_memory(0, 1_048_576),
+            (1_048_576, "macos_free_pages_fallback")
+        );
+        assert_eq!(admission_available_memory(0, 0), (0, "sysinfo_available"));
+        assert_eq!(
+            admission_available_memory(2_097_152, 1_048_576),
+            (2_097_152, "sysinfo_available")
+        );
+        let (zero, _) = admission_available_memory(0, 0);
+        assert_eq!(memory_gate(1, zero, 0, 0).status, "BLOCKED_RESOURCE");
+        let (free_pages, _) = admission_available_memory(0, 1_048_576);
+        assert_eq!(
+            memory_gate(1, free_pages, 1_048_576, 0).status,
+            "BLOCKED_RESOURCE"
+        );
+        assert_eq!(
+            memory_gate(1_048_577, free_pages, 0, 0).status,
+            "BLOCKED_RESOURCE"
+        );
     }
 }
