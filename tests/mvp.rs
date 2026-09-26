@@ -28,7 +28,9 @@ impl Harness {
         let service_port = free_port();
         let external_port = free_port();
         let slow_port = free_port();
-        fs::write(dir.path().join("runtime.yaml"),format!("port: {port}\nstate_dir: state\nsafety_margin_bytes: 0\nservices:\n  demo:\n    mode: managed\n    command: ['@self', fixture, '{service_port}']\n    port: {service_port}\n    memory_bytes: 1048576\n    disposable: true\n    allowed_actions: [start, stop, restart]\n  external:\n    mode: discovered\n    port: {external_port}\n  slow:\n    mode: managed\n    command: [/bin/sleep, '30']\n    port: {slow_port}\n    startup_timeout_ms: 100\n    allowed_actions: [start, stop]\n  fail:\n    mode: managed\n    command: [/usr/bin/false]\n    allowed_actions: [start, stop]\n")).unwrap();
+        // The short-lived test commands have explicit startup reservations so
+        // their rollback paths are not masked by the unknown-memory gate.
+        fs::write(dir.path().join("runtime.yaml"),format!("port: {port}\nstate_dir: state\nsafety_margin_bytes: 0\nservices:\n  demo:\n    mode: managed\n    command: ['@self', fixture, '{service_port}']\n    port: {service_port}\n    memory_bytes: 1048576\n    disposable: true\n    allowed_actions: [start, stop, restart]\n  external:\n    mode: discovered\n    port: {external_port}\n  slow:\n    mode: managed\n    command: [/bin/sleep, '30']\n    port: {slow_port}\n    memory_bytes: 16777216\n    startup_timeout_ms: 100\n    allowed_actions: [start, stop]\n  fail:\n    mode: managed\n    command: [/usr/bin/false]\n    memory_bytes: 16777216\n    allowed_actions: [start, stop]\n")).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
             .arg("serve")
             .arg(dir.path().join("runtime.yaml"))
@@ -124,12 +126,45 @@ fn lifecycle_shared_leases_and_blocked_resources() {
             .all(|l| serde_json::from_str::<Value>(l).is_ok())
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn memory_status_identifies_the_admission_source() {
+    let h = Harness::new();
+    let status = h.call("runtime.status", json!({}));
+    let memory = &status["memory"];
+    let sysinfo = memory["sysinfo_available"].as_u64().unwrap();
+    let free = memory["free_memory"].as_u64().unwrap();
+    println!(
+        "admission memory: sysinfo_available={sysinfo}, free_memory={free}, available={}, basis={}",
+        memory["available"], memory["available_basis"]
+    );
+    if sysinfo == 0 && free > 0 {
+        assert_eq!(memory["available"], free);
+        assert_eq!(memory["available_basis"], "macos_free_pages_fallback");
+    } else {
+        assert_eq!(memory["available"], sysinfo);
+        assert_eq!(memory["available_basis"], "sysinfo_available");
+    }
+}
 #[test]
 fn external_listener_is_never_adopted_or_stopped() {
     let h = Harness::new();
     let listener = TcpListener::bind(("127.0.0.1", h.service_port)).unwrap();
     let v = h.call("services.get", json!({"service_id":"demo"}));
-    assert_eq!(v["class"], "discovered");
+    assert_eq!(v["state"], "unhealthy");
+    assert_eq!(v["leases"], json!([]));
+    assert_eq!(v["actions"], json!([]));
+    let blocked = h.request("external-port");
+    assert_eq!(blocked["status"], "BLOCKED_SERVICE");
+    assert_eq!(
+        h.call("jobs.get", json!({"job_id":"external-port"}))["status"],
+        "BLOCKED_SERVICE"
+    );
+    assert_eq!(
+        h.call("services.get", json!({"service_id":"demo"}))["leases"],
+        json!([])
+    );
     assert_eq!(
         h.rpc("services.start", json!({"service_id":"demo"}))["result"]["isError"],
         true
@@ -224,9 +259,21 @@ fn stdio_protocol_and_http_security() {
 #[test]
 fn restart_preserves_leases_without_adopting_processes() {
     let mut h = Harness::new();
-    let _listener = TcpListener::bind(("127.0.0.1", h.service_port)).unwrap();
     let lease = h.request("existing");
     assert_eq!(lease["status"], "READY");
+    let service = h.call("services.get", json!({"service_id":"demo"}));
+    let pid = service["processes"][0]["pid"].as_u64().unwrap() as i32;
+    // End this test-owned fixture before replacing it with an unrelated
+    // listener. The restarted daemon must not adopt the replacement.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let listener = loop {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", h.service_port)) {
+            break listener;
+        }
+        assert!(Instant::now() < deadline, "test fixture did not exit");
+        thread::sleep(Duration::from_millis(50));
+    };
     h.child.kill().unwrap();
     h.child.wait().unwrap();
     h.child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
@@ -251,8 +298,8 @@ fn restart_preserves_leases_without_adopting_processes() {
     );
     assert_eq!(h.request("existing")["status"], "BLOCKED_SERVICE");
     assert_eq!(
-        h.call("services.get", json!({"service_id":"demo"}))["class"],
-        "discovered"
+        h.call("services.get", json!({"service_id":"demo"}))["state"],
+        "unhealthy"
     );
     assert_eq!(
         h.rpc("services.stop", json!({"service_id":"demo"}))["result"]["isError"],
@@ -265,6 +312,7 @@ fn restart_preserves_leases_without_adopting_processes() {
             .unwrap()
             .is_empty()
     );
+    assert!(listener.local_addr().is_ok());
 }
 
 #[test]
