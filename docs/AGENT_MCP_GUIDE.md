@@ -1,8 +1,8 @@
 # Runtime Gatekeeper：Agent MCP 操作指南
 
-這份指南給會呼叫 Runtime Gatekeeper MCP 的 Agent。目標是讓 Agent 宣告工作需要的服務，接收准入結果，完成後釋放工作租約；環境檢查、程序辨識和服務生命週期由 Runtime Gatekeeper 管理。
+需要執行工單時，用 `mcp` 申請與釋放本單租約。日常盤點用 `mcp-observe`，直接查詢 `runtime.observe`，無須建立工單或租約。兩種入口均由本次隨附的 Apple Silicon 執行檔提供。
 
-## Agent 必須遵守的流程
+## 需要准入的工單流程
 
 1. **每個新工作只送一次 `runtime.request`。** 在同一份 request 中列出這項工作必需的所有服務，不要逐項試服務，也不要自行查程序、port、RAM 或執行環境。
 2. **只有收到 `READY` 才開始依賴這些服務的工作。** 記下回傳的 `runtime_id`。
@@ -20,6 +20,8 @@ Runtime Gatekeeper daemon 必須先運行。MCP stdio bridge 是客戶端啟動�
 若尚未部署 daemon，可在專案目錄前景啟動：
 
 ```sh
+shasum -a 256 -c bin/SHA256SUMS
+./bin/runtime-gatekeeper check runtime.yaml
 ./bin/runtime-gatekeeper serve runtime.yaml
 ```
 
@@ -27,9 +29,25 @@ Runtime Gatekeeper daemon 必須先運行。MCP stdio bridge 是客戶端啟動�
 
 GitHub 附帶的 macOS 執行檔目前未經 Developer ID 簽章與 Apple 公證，系統可能會阻擋執行。若遇到此情況，請依 README 的建置方式從可信任的原始碼編譯；不要為了讓 Agent 連線而停用 Gatekeeper。
 
+### 驗證唯讀觀察
+
+依 [README](../README.md) 啟動獨立測試 daemon 後，在第二個終端進入同一個專案目錄。下例以 stdio 完成 MCP 握手、列工具，再讀取主機及 `sample` 的觀察值：
+
+```sh
+./bin/runtime-gatekeeper mcp-observe runtime-smoke.yaml <<'JSONRPC'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"read-only-check","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"runtime.observe","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"runtime.observe","arguments":{"service_id":"sample"}}}
+JSONRPC
+```
+
+回覆 2 應列六項查詢工具，包含 `runtime.observe`。回覆 3、4 的 `result.isError` 應為 `false`，`result.structuredContent.observation_only` 為 `true`，並有 `snapshot.id`。回覆 4 的服務列應有 `sample`；範例未設定原生佇列來源，佇列數量為未知。面板與 MCP 的 CPU、RAM 和 swap 可在 `snapshot.id` 相同時逐項核對。
+
 ### Hermes Agent
 
-在 `~/.hermes/config.yaml` 加入以下區段，將兩個路徑換成此機器上的絕對路徑：
+在 Hermes 使用的設定檔（預設 profile 為 `~/.hermes/config.yaml`）加入以下區段。將兩個路徑換成此機器上的絕對路徑；試跑時，設定檔路徑須指向測試 daemon 的 `runtime-smoke.yaml`。本例供需要申請租約的執行器使用，觀察專用 profile 應將第一個參數 `mcp` 改為 `mcp-observe`。
 
 ```yaml
 mcp_servers:
@@ -51,7 +69,7 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
 
 ### 其他支援 MCP 的客戶端
 
-若客戶端使用 JSON `mcpServers` 設定，可填入：
+若客戶端使用 JSON `mcpServers` 設定，以下為唯讀盤點範例。需准入的執行器將第一個參數改為 `mcp`；設定檔均須與目標 daemon 一致。
 
 ```json
 {
@@ -59,7 +77,7 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
     "runtime-gatekeeper": {
       "command": "/absolute/path/runtime-gatekeeper/bin/runtime-gatekeeper",
       "args": [
-        "mcp",
+        "mcp-observe",
         "/absolute/path/runtime-gatekeeper/runtime.yaml"
       ]
     }
