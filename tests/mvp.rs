@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     net::TcpListener,
     process::{Child, Command, Stdio},
@@ -26,6 +27,9 @@ impl Harness {
         Self::with_timeout(100)
     }
     fn with_timeout(timeout_ms: u64) -> Self {
+        Self::with_extra_services(timeout_ms, "")
+    }
+    fn with_extra_services(timeout_ms: u64, extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
         let service_port = free_port();
@@ -43,7 +47,7 @@ impl Harness {
                 service_port
             ),
         );
-        fs::write(&config_path, config).unwrap();
+        fs::write(&config_path, config + extra).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
             .arg("serve")
             .arg(dir.path().join("runtime.yaml"))
@@ -70,7 +74,15 @@ impl Harness {
         }
     }
     fn rpc(&self, name: &str, args: Value) -> Value {
-        ureq::post(&format!("http://127.0.0.1:{}/rpc",self.port)).set("Authorization",&format!("Bearer {}",self.token)).send_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).unwrap().into_json().unwrap()
+        self.rpc_as(&self.token, name, args)
+    }
+    fn rpc_as(&self, token: &str, name: &str, args: Value) -> Value {
+        ureq::post(&format!("http://127.0.0.1:{}/rpc", self.port))
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}))
+            .unwrap()
+            .into_json()
+            .unwrap()
     }
     fn call(&self, name: &str, args: Value) -> Value {
         let v = self.rpc(name, args);
@@ -851,4 +863,162 @@ fn observer_filters_catalog_and_refuses_direct_control_including_cleanup() {
         before,
         (fs::read(state_file).unwrap(), fs::read(events).unwrap())
     );
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize)]
+struct FixtureProcess {
+    pid: u32,
+    start_time: u64,
+}
+
+// Only the stable service fields participate in the before/after comparison.
+#[derive(Debug, PartialEq, serde::Deserialize)]
+struct FixtureService {
+    id: String,
+    state: String,
+    class: String,
+    leases: Vec<Value>,
+    processes: Vec<FixtureProcess>,
+}
+
+fn observer_inventory(h: &Harness, token: &str) -> BTreeMap<String, FixtureService> {
+    let list = h.rpc_as(token, "services.list", json!({}));
+    assert_eq!(list["result"]["isError"], false);
+    let rows: Vec<FixtureService> =
+        serde_json::from_value(list["result"]["structuredContent"]["services"].clone()).unwrap();
+    rows.into_iter().map(|s| (s.id.clone(), s)).collect()
+}
+
+#[test]
+fn direct_rpc_observer_cannot_mutate_and_admin_cleanup_only_stops_eligible_services() {
+    // Each reader exits on EOF when the test drops its only writer, including
+    // the service whose policy deliberately forbids Gatekeeper from stopping it.
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = dir.path().join("fixture.pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pipe)
+        .unwrap();
+    let cat = fs::canonicalize("/bin/cat").unwrap();
+    // The external child waits on its own stdin. Its unique file argument
+    // identifies it to discovery, even with other test suites running.
+    let marker = dir.path().join("external-marker");
+    fs::write(&marker, []).unwrap();
+    let mut foreign = Command::new(&cat)
+        .arg("-")
+        .arg(&marker)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut extra = String::new();
+    for (id, disposable, actions) in [
+        ("idle", true, vec!["start", "stop", "restart"]),
+        ("held", true, vec!["start", "stop"]),
+        ("persistent", false, vec!["start", "stop"]),
+        ("no-stop", true, vec!["start"]),
+        ("foreign", true, vec!["start", "stop"]),
+    ] {
+        let mut config = json!({"mode":"managed", "command":[cat, pipe], "memory_bytes":0,
+                                "disposable":disposable, "allowed_actions":actions});
+        if id == "foreign" {
+            config["match_executable"] = json!(cat);
+            config["match_args"] = json!([marker]);
+        }
+        extra.push_str(&format!("  {id}: {config}\n"));
+    }
+    let h = Harness::with_extra_services(100, &extra);
+    for id in ["idle", "persistent", "no-stop"] {
+        h.call("services.start", json!({"service_id":id}));
+    }
+    let lease = h.call(
+        "runtime.request",
+        json!({"job_id":"held-job","agent":"test","requires":["held"],"memory_bytes":0}),
+    );
+    assert_eq!(lease["status"], "READY");
+
+    let state = h.dir.path().join("state");
+    let observer = fs::read_to_string(state.join("observer-token")).unwrap();
+    assert!(!observer.is_empty() && observer != h.token);
+    let ledger = || {
+        (
+            fs::read(state.join("state.json")).unwrap(),
+            fs::read(state.join("events.jsonl")).unwrap(),
+        )
+    };
+    let mut before = observer_inventory(&h, &observer);
+    let running = ["idle", "held", "persistent", "no-stop", "foreign"];
+    for id in running {
+        assert_eq!(before[id].state, "running", "{id}");
+        assert_eq!(before[id].processes.len(), 1, "{id}");
+        if id != "held" {
+            assert!(before[id].leases.is_empty(), "{id}");
+        }
+    }
+    assert_eq!(before["foreign"].class, "discovered");
+    assert_eq!(before["foreign"].processes[0].pid, foreign.id());
+    assert_eq!(before["demo"].state, "stopped");
+    assert_eq!(before["held"].leases[0]["runtime_id"], lease["runtime_id"]);
+    assert_eq!(before["held"].leases[0]["status"], "READY");
+    let jobs = || h.call("jobs.list", json!({}))["jobs"].clone();
+    let original_jobs = jobs();
+    let original_ledger = ledger();
+    for (name, args) in [
+        ("services.start", json!({"service_id":"demo"})),
+        ("services.stop", json!({"service_id":"idle"})),
+        ("services.restart", json!({"service_id":"idle"})),
+        (
+            "runtime.request",
+            json!({"job_id":"observer-job","agent":"test","requires":["demo"],"memory_bytes":0}),
+        ),
+        ("runtime.release", json!({"runtime_id":lease["runtime_id"]})),
+        ("runtime.cleanup", json!({})),
+    ] {
+        let reply = h.rpc_as(&observer, name, args);
+        assert_eq!(
+            reply["error"],
+            json!({"code":-32602,"message":"Unknown tool"}),
+            "{name}"
+        );
+        assert!(reply.get("result").is_none(), "{name}");
+    }
+    assert_eq!(observer_inventory(&h, &observer), before);
+    assert_eq!(ledger(), original_ledger);
+    assert_eq!(jobs(), original_jobs);
+    assert!(TcpListener::bind(("127.0.0.1", h.service_port)).is_ok());
+
+    let cleaned = h.call("runtime.cleanup", json!({}));
+    assert_eq!(
+        cleaned["results"],
+        json!([{"service":"idle","result":"stopped"}])
+    );
+    // Check the OS process identities too: removing an entry from the
+    // supervisor's inventory alone would not prove that cleanup stopped it.
+    let pids = running.map(|id| sysinfo::Pid::from_u32(before[id].processes[0].pid));
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+    for (id, pid) in running.into_iter().zip(pids) {
+        let same_process = system
+            .process(pid)
+            .is_some_and(|p| p.start_time() == before[id].processes[0].start_time);
+        assert_eq!(same_process, id != "idle", "{id}");
+    }
+    let mut after = observer_inventory(&h, &observer);
+    let stopped = after.remove("idle").unwrap();
+    assert_eq!(stopped.state, "stopped");
+    assert!(stopped.processes.is_empty());
+    before.remove("idle").unwrap();
+    assert_eq!(after, before);
+    assert_eq!(jobs(), original_jobs);
+    assert!(foreign.try_wait().unwrap().is_none());
+
+    drop(writer);
+    assert!(foreign.wait().unwrap().success());
 }
