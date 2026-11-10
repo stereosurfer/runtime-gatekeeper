@@ -125,4 +125,6 @@ Hermes 的 MCP 設定只會讓 Hermes 看見這些工具；每個 MCP 客戶端�
 
 ## 可用工具與 Agent 使用範圍
 
+需要判讀資源時，先查本次會話實際列出的工具。若有 `runtime.observe`，傳入 `{"service_id":"已登錄的服務 ID"}` 可取得該服務的快照和可用的原生佇列證據。省略參數可查全機預留與壓力。讀取 native_queue 的 value、availability、reason、instance 及 timestamp。sampler_busy 可稍後再查一次；未取得請報未知。running/pending 只屬於該服務實例。即使只有一張租約，也缺少把這些數量配給該工單的依據。留意每個值的來源、單位、取樣時間與可用性。舊版只有 `runtime.status` 時，將缺少的佇列及圖形記憶體列為未知；需要確認服務閒置的工單請等擁有者核對。唯讀 client 使用 `runtime-gatekeeper mcp-observe runtime.yaml`。
+
 Runtime Gatekeeper 也提供唯讀工具 `runtime.status`、`services.list/get`、`jobs.list/get`，供使用者或明確要求檢查狀態的工作查閱。正常工作路徑只需 `runtime.request` 和 `runtime.release`。服務控制與清理工具由管理員按明確決策操作，不屬於 Agent 自動排障流程。

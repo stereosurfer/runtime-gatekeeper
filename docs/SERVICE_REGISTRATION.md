@@ -38,3 +38,26 @@ Gatekeeper 只管理 `runtime.yaml` 已定義的 service ID。外部安裝程式
 - `BLOCKED_SERVICE`：所需服務沒有通過身分與健康檢查；`expanded_requires` 列出服務相依展開結果。
 
 監聽者歸屬使用 macOS 內建 `lsof` 讀取；探針不可用時採保守阻擋。它只確認觀察時的 socket 擁有者，並非模型載入或未來生成成功的保證。
+
+## 原生佇列的唯讀來源
+
+在已核准的服務項目中指定來源。以下是設定片段；替換服務 ID、連接埠、路徑及身分比對資料，就能用於另一個相容服務。
+
+```yaml
+services:
+  example-worker:
+    mode: discovered
+    match_executable: /absolute/path/to/worker
+    match_args: ["--instance=example"]
+    port: 49321
+    queue_source:
+      path: /v1/metrics/queue
+      format: counts
+```
+
+- `counts` 接受 running、pending 兩個非負整數；`comfy_queue` 從 queue_running、queue_pending 陣列取長度。原始內容與回傳的其他欄位不會進入觀察回覆。工作歸屬固定為 unknown。要關聯 attempt，需由執行器另提供可核對的原生工作 ID。
+- 管理員需確認指定 GET 路徑具唯讀語意。來源只可使用登錄服務在 127.0.0.1 的連接埠與設定檔中的路徑；不接受任意 URL、查詢字串、代理、重新導向、其他 HTTP 方法或呼叫端覆寫。省略 queue_source 即關閉探測。先前使用固定服務名稱及埠的候選設定，需明確補上來源。
+- 使用 `runtime.observe` 並指定 service_id 才讀原生佇列。一般狀態、Dashboard、全機觀察都不發佇列 GET。有來源但讀不到時回 null、unavailable 及原因；成功讀到 0/0 才表示該次端點樣本為空。
+- macOS 需要健康狀態、可驗證的唯一監聽程序、與登錄服務一致的 PID 及含微秒的啟動時間。每次在發 GET 前及取得回覆後都核對；不一致丟棄此次結果。單次 HTTP 限時 600 ms、內容上限 256 KiB；監聽者查詢另有時限。單一讀取執行緒忙時回未知，不排隊。
+- 回應的 instance 給出 PID、啟動時間（Unix 秒）及 birth_marker（該秒內的微秒）。timestamp 是此次端點讀取時間，與主機快照各自記錄。last_success_at 僅供當前可驗證實例參考，失敗時仍不回填舊數量。沒有保存前次佇列內容。其他平台缺少相同的實例驗證時會回未知。
+- 程序及監聽者核對是取樣邊界，不是端點認證。同一 PID 內的模型熱載入、遠端代理的後端切換，以及兩次取樣間已完成的短工作，需要服務另提供原生身分或事件才能辨認。

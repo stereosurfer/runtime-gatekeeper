@@ -150,17 +150,21 @@ impl Engine {
             .system
             .processes()
             .iter()
-            .map(|(pid, p)| Process {
-                pid: pid.as_u32(),
-                parent: p.parent().map(|p| p.as_u32()),
-                start_time: p.start_time(),
-                name: p.name().to_string_lossy().into(),
-                executable: p.exe().map(|p| p.to_path_buf()),
-                args: p.cmd().iter().map(|s| s.to_string_lossy().into()).collect(),
-                ram_bytes: measured_memory(pid.as_u32(), p.memory()),
-                cpu_percent: p.cpu_usage(),
-                service: None,
-                class: "unknown".into(),
+            .map(|(pid, p)| {
+                let (ram_bytes, memory_basis) = measured_memory(pid.as_u32(), p.memory());
+                Process {
+                    pid: pid.as_u32(),
+                    parent: p.parent().map(|p| p.as_u32()),
+                    start_time: p.start_time(),
+                    name: p.name().to_string_lossy().into(),
+                    executable: p.exe().map(|p| p.to_path_buf()),
+                    args: p.cmd().iter().map(|s| s.to_string_lossy().into()).collect(),
+                    ram_bytes,
+                    memory_basis: memory_basis.into(),
+                    cpu_percent: p.cpu_usage(),
+                    service: None,
+                    class: "unknown".into(),
+                }
             })
             .collect();
         for row in &mut rows {
@@ -228,6 +232,13 @@ impl Engine {
             let identity_verified=s.port.map(|port| listeners.as_ref()
                 .and_then(|map|map.get(&port))
                 .is_some_and(|owners|ps.iter().any(|p|owners.contains(&p.pid))));
+            let service_instance = s.port.and_then(|port| {
+                let owners = listeners.as_ref()?.get(&port)?;
+                if owners.len() != 1 { return None; }
+                let pid = *owners.first()?;
+                let p = ps.iter().find(|p| p.pid == pid)?;
+                crate::platform::process_instance(pid).filter(|birth| birth.start_time == p.start_time)
+            });
             let healthy=s.port.map(|port| port_reachable && identity_verified==Some(true)
                 && s.http_health_path.as_ref().is_none_or(|path|http_ready(port,path)));
             let class=if self.owned.contains_key(id) || (s.mode==Mode::Managed && ps.is_empty()) {"managed"} else {"discovered"};
@@ -238,7 +249,7 @@ impl Engine {
             if s.mode==Mode::Managed && class=="managed" && leases.is_empty() {
                 for a in &s.allowed_actions { if (a=="start" && !running && !port_reachable) || (a!="start" && self.owned.contains_key(id)) { actions.push(a); } }
             }
-            json!({"id":id,"class":class,"configured_mode":s.mode,"state":state,"healthy":healthy,"identity_verified":identity_verified,"ownership_probe_available":listeners.is_some(),"http_health_path":s.http_health_path,"exclusive_group":s.exclusive_group,"requires":s.requires,"port":s.port,"ram_bytes":ps.iter().map(|p|p.ram_bytes).sum::<u64>(),"cpu_percent":ps.iter().map(|p|p.cpu_percent).sum::<f32>(),"memory_estimate_bytes":s.memory_bytes,"disposable":s.disposable,"leases":leases,"processes":ps,"actions":actions})
+            json!({"id":id,"class":class,"configured_mode":s.mode,"state":state,"healthy":healthy,"identity_verified":identity_verified,"ownership_probe_available":listeners.is_some(),"queue_source":s.queue_source,"queue_instance":s.queue_source.as_ref().and(service_instance.as_ref()),"service_instance":service_instance,"http_health_path":s.http_health_path,"exclusive_group":s.exclusive_group,"requires":s.requires,"port":s.port,"ram_bytes":ps.iter().map(|p|p.ram_bytes).sum::<u64>(),"cpu_percent":ps.iter().map(|p|p.cpu_percent).sum::<f32>(),"memory_estimate_bytes":s.memory_bytes,"disposable":s.disposable,"leases":leases,"processes":ps,"actions":actions})
         }).collect()
     }
     pub fn status(&mut self) -> Value {
@@ -250,7 +261,7 @@ impl Engine {
         let system_unaccounted = self.system.used_memory().saturating_sub(process_total);
         let (admission_available, available_basis) =
             admission_available_memory(self.system.available_memory(), self.system.free_memory());
-        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"total":self.system.total_memory(),"used":self.system.used_memory(),"available":admission_available,"sysinfo_available":self.system.available_memory(),"free_memory":self.system.free_memory(),"available_basis":available_basis,"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted,"process_basis":process_memory_basis()},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
+        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"pressure":crate::observation::system_pressure(),"host_available":self.system.available_memory(),"total":self.system.total_memory(),"used":self.system.used_memory(),"available":admission_available,"sysinfo_available":self.system.available_memory(),"free_memory":self.system.free_memory(),"available_basis":available_basis,"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted,"process_basis":process_memory_basis()},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
     }
     fn action_allowed(&self, id: &str, action: &str) -> Result<Service> {
         let s = self.config.services.get(id).context("unknown service")?;

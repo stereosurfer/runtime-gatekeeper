@@ -23,6 +23,9 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        Self::with_timeout(100)
+    }
+    fn with_timeout(timeout_ms: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
         let service_port = free_port();
@@ -30,7 +33,17 @@ impl Harness {
         let slow_port = free_port();
         // The short-lived test commands have explicit startup reservations so
         // their rollback paths are not masked by the unknown-memory gate.
-        fs::write(dir.path().join("runtime.yaml"),format!("port: {port}\nstate_dir: state\nsafety_margin_bytes: 0\nservices:\n  demo:\n    mode: managed\n    command: ['@self', fixture, '{service_port}']\n    port: {service_port}\n    memory_bytes: 1048576\n    disposable: true\n    allowed_actions: [start, stop, restart]\n  external:\n    mode: discovered\n    port: {external_port}\n  slow:\n    mode: managed\n    command: [/bin/sleep, '30']\n    port: {slow_port}\n    memory_bytes: 16777216\n    startup_timeout_ms: 100\n    allowed_actions: [start, stop]\n  fail:\n    mode: managed\n    command: [/usr/bin/false]\n    memory_bytes: 16777216\n    allowed_actions: [start, stop]\n")).unwrap();
+        fs::write(dir.path().join("runtime.yaml"),format!("port: {port}\nstate_dir: state\nsafety_margin_bytes: 0\nservices:\n  demo:\n    mode: managed\n    command: ['@self', fixture, '{service_port}']\n    port: {service_port}\n    memory_bytes: 1048576\n    disposable: true\n    allowed_actions: [start, stop, restart]\n  external:\n    mode: discovered\n    port: {external_port}\n  slow:\n    mode: managed\n    command: [/bin/sleep, '30']\n    port: {slow_port}\n    memory_bytes: 16777216\n    startup_timeout_ms: {timeout_ms}\n    allowed_actions: [start, stop]\n  fail:\n    mode: managed\n    command: [/usr/bin/false]\n    memory_bytes: 16777216\n    allowed_actions: [start, stop]\n")).unwrap();
+        let config_path = dir.path().join("runtime.yaml");
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "    disposable: true",
+            &format!(
+                "    match_executable: '{}'\n    match_args: [fixture, '{}']\n    disposable: true",
+                env!("CARGO_BIN_EXE_runtime-gatekeeper"),
+                service_port
+            ),
+        );
+        fs::write(&config_path, config).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
             .arg("serve")
             .arg(dir.path().join("runtime.yaml"))
@@ -192,8 +205,19 @@ fn memory_status_identifies_the_admission_source() {
 fn external_listener_is_never_adopted_or_stopped() {
     let h = Harness::new();
     let listener = TcpListener::bind(("127.0.0.1", h.service_port)).unwrap();
-    let v = h.call("services.get", json!({"service_id":"demo"}));
-    assert_eq!(v["state"], "unhealthy");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let v = loop {
+        let v = h.call("services.get", json!({"service_id":"demo"}));
+        if v["state"] == "unhealthy" {
+            break v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "external listener missing from snapshot"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(v["identity_verified"], false);
     assert_eq!(v["leases"], json!([]));
     assert_eq!(v["actions"], json!([]));
     let blocked = h.request("external-port");
@@ -291,7 +315,7 @@ fn stdio_protocol_and_http_security() {
         .collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 12);
     let url = format!("http://127.0.0.1:{}/api/status", h.port);
     assert!(matches!(
         ureq::get(&url).call(),
@@ -575,4 +599,256 @@ fn rollback_write_failure_keeps_survivor_visible_and_disables_control() {
         }
     }
     thread::sleep(Duration::from_millis(100));
+}
+
+struct McpClient {
+    child: Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl McpClient {
+    fn new(h: &Harness, name: &str) -> Self {
+        Self::with_mode(h, name, "mcp")
+    }
+    fn with_mode(h: &Harness, name: &str, mode: &str) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
+            .arg(mode)
+            .arg(h.dir.path().join("runtime.yaml"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut c = Self {
+            child,
+            input,
+            output,
+        };
+        assert!(c.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":name,"version":"test"}}}))["result"].is_object());
+        c
+    }
+    fn send(&mut self, v: Value) -> Value {
+        use std::io::{BufRead, Write};
+        writeln!(self.input, "{v}").unwrap();
+        self.input.flush().unwrap();
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    fn call(&mut self, name: &str, args: Value) -> Value {
+        self.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":args}}))
+    }
+}
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn snapshot_and_mcp_remain_responsive_during_slow_start() {
+    let h = Harness::with_timeout(2500);
+    let mut mcp = McpClient::new(&h, "slow-start-observer");
+    thread::scope(|scope| {
+        let control = scope.spawn(|| h.rpc("services.start", json!({"service_id":"slow"})));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = h.call("runtime.status", json!({}));
+            if status["snapshot"]["control_operation"] == "services.start" {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let start = Instant::now();
+        let status: Value = ureq::get(&format!("http://127.0.0.1:{}/api/status", h.port))
+            .set("Authorization", &format!("Bearer {}", h.token))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(status["snapshot"]["control_operation"], "services.start");
+        assert_eq!(
+            mcp.call("runtime.status", json!({}))["result"]["isError"],
+            false
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "read paths blocked behind startup"
+        );
+        assert_eq!(control.join().unwrap()["result"]["isError"], true);
+    });
+    assert!(h.call("runtime.status", json!({}))["snapshot"]["control_operation"].is_null());
+}
+#[test]
+fn two_clients_share_leases_and_one_disconnect_does_not_stop_other() {
+    let h = Harness::new();
+    let mut a = McpClient::new(&h, "client-a");
+    let mut b = McpClient::new(&h, "client-b");
+    let list = a.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
+    for t in list["result"]["tools"].as_array().unwrap() {
+        assert_eq!(t["outputSchema"]["type"], "object");
+        assert!(t["outputSchema"]["required"].is_array());
+    }
+    let one = a.call(
+        "runtime.request",
+        json!({"job_id":"a","agent":"a","requires":["demo"]}),
+    )["result"]["structuredContent"]
+        .clone();
+    let two = b.call(
+        "runtime.request",
+        json!({"job_id":"b","agent":"b","requires":["demo"]}),
+    )["result"]["structuredContent"]
+        .clone();
+    assert_eq!(one["status"], "READY");
+    assert_eq!(two["status"], "READY");
+    drop(a);
+    assert_eq!(b.call("services.get",json!({"service_id":"demo"}))["result"]["structuredContent"]["leases"].as_array().unwrap().len(),2);
+    let s = b.call("runtime.status", json!({}))["result"]["structuredContent"].clone();
+    assert_eq!(s["mcp"]["clients"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        s["mcp"]["tool_exposure"],
+        "unknown_requires_client_verification"
+    );
+    for c in s["mcp"]["clients"].as_array().unwrap() {
+        assert!(c["initialized_at"].is_number());
+        assert!(c["last_successful_call_at"].is_number());
+    }
+    for service in s["services"].as_array().unwrap() {
+        for p in service["processes"].as_array().unwrap() {
+            assert!(
+                ["phys_footprint", "rss_fallback", "rss"]
+                    .contains(&p["memory_basis"].as_str().unwrap())
+            );
+        }
+    }
+    for lease in [one, two] {
+        assert_eq!(
+            b.call("runtime.release", json!({"runtime_id":lease["runtime_id"]}))["result"]["structuredContent"]
+                ["status"],
+            "RELEASED"
+        );
+    }
+    b.call("runtime.cleanup", json!({}));
+    assert_eq!(
+        b.call("services.get", json!({"service_id":3}))["error"]["code"],
+        -32602
+    );
+}
+
+#[test]
+fn bridge_survives_transport_error_and_token_rotation() {
+    let mut h = Harness::new();
+    let mut client = McpClient::new(&h, "restart-observer");
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    assert_eq!(
+        client.call("runtime.status", json!({}))["error"]["code"],
+        -32000
+    );
+    h.child = Command::new(env!("CARGO_BIN_EXE_runtime-gatekeeper"))
+        .arg("serve")
+        .arg(h.dir.path().join("runtime.yaml"))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let new_token = fs::read_to_string(h.dir.path().join("state/token")).unwrap_or_default();
+        if !new_token.is_empty() && new_token != h.token {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        client.call("runtime.status", json!({}))["result"]["isError"],
+        false
+    );
+}
+
+#[test]
+fn observation_read_does_not_grant_a_lease_or_mutate_runtime_state() {
+    let h = Harness::new();
+    let state = h.dir.path().join("state");
+    let before = fs::read(state.join("state.json")).unwrap();
+    let events = fs::read(state.join("events.jsonl")).unwrap();
+    let v = h.call("runtime.observe", json!({"service_id":"demo"}));
+    assert_eq!(v["observation_only"], true);
+    assert!(v["snapshot"]["sampled_at"].is_u64());
+    assert_eq!(
+        v["services"][0]["native_queue"]["reason"],
+        "no_configured_source"
+    );
+    assert_eq!(
+        v["system"]["pressure"]["source"],
+        "sysctl:kern.memorystatus_vm_pressure_level"
+    );
+    assert_eq!(
+        h.rpc("runtime.observe", json!({"service_id":"nope"}))["result"]["isError"],
+        true
+    );
+    assert!(
+        h.rpc("runtime.observe", json!({"action":"cleanup"}))
+            .get("error")
+            .is_some()
+    );
+    assert_eq!(before, fs::read(state.join("state.json")).unwrap());
+    assert_eq!(events, fs::read(state.join("events.jsonl")).unwrap());
+    assert!(TcpListener::bind(("127.0.0.1", h.service_port)).is_ok());
+}
+
+#[test]
+fn observer_filters_catalog_and_refuses_direct_control_including_cleanup() {
+    let h = Harness::new();
+    let mut observer = McpClient::with_mode(&h, "local-admin", "mcp-observe");
+    let list = observer.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+    let names: Vec<_> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "runtime.status",
+            "runtime.observe",
+            "services.list",
+            "services.get",
+            "jobs.list",
+            "jobs.get"
+        ]
+    );
+    let registry = observer.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"jobs.list","arguments":{}}}));
+    let data = &registry["result"]["structuredContent"];
+    assert_eq!(data["jobs"], json!([]));
+    assert_eq!(
+        data["evidence_scope"]["native_queue"],
+        "unavailable_in_this_view"
+    );
+    let state_file = h.dir.path().join("state/state.json");
+    let events = h.dir.path().join("state/events.jsonl");
+    let before = (fs::read(&state_file).unwrap(), fs::read(&events).unwrap());
+    for (name, args) in [
+        ("runtime.cleanup", json!({})),
+        (
+            "runtime.request",
+            json!({"job_id":"x","agent":"observer","requires":["demo"]}),
+        ),
+        ("runtime.release", json!({"runtime_id":"x"})),
+        ("services.start", json!({"service_id":"demo"})),
+        ("services.stop", json!({"service_id":"demo"})),
+        ("services.restart", json!({"service_id":"demo"})),
+    ] {
+        let out = observer.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":args}}));
+        assert_eq!(out["error"]["code"], -32602, "{out}");
+    }
+    assert_eq!(
+        before,
+        (fs::read(state_file).unwrap(), fs::read(events).unwrap())
+    );
 }

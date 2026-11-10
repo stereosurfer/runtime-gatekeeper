@@ -1,8 +1,11 @@
 mod engine;
+mod host_sample;
 mod model;
+mod observation;
 mod platform;
 mod protocol;
-use anyhow::{Context, Result, bail, ensure};
+mod server;
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
@@ -25,9 +28,9 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if !["serve", "mcp", "check"].contains(&mode) {
+    if !["serve", "mcp", "mcp-observe", "check"].contains(&mode) {
         println!(
-            "Runtime Gatekeeper\n  runtime-gatekeeper serve [runtime.yaml]\n  runtime-gatekeeper mcp [runtime.yaml]\n  runtime-gatekeeper check [runtime.yaml]"
+            "Runtime Gatekeeper\n  runtime-gatekeeper serve [runtime.yaml]\n  runtime-gatekeeper mcp [runtime.yaml]\n  runtime-gatekeeper mcp-observe [runtime.yaml]\n  runtime-gatekeeper check [runtime.yaml]"
         );
         return Ok(());
     }
@@ -42,94 +45,20 @@ fn main() -> Result<()> {
         println!("Configuration valid: {} services", config.services.len());
         return Ok(());
     }
-    if mode == "mcp" {
-        return bridge(config);
+    if mode == "mcp" || mode == "mcp-observe" {
+        return bridge(config, mode == "mcp-observe");
     }
     let port = config.port;
     // Bind first: failure must not mutate live state or credentials.
     let server = Server::http(("127.0.0.1", port)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let mut engine = engine::Engine::new(config)?;
-    let token = uuid::Uuid::new_v4().to_string();
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(engine.config.state_dir.join("token"))?;
-    f.write_all(token.as_bytes())?;
-    f.sync_all()?;
+    let engine = engine::Engine::new(config)?;
+    let observer_token = new_token(&engine.config.state_dir.join("observer-token"))?;
+    let token = new_token(&engine.config.state_dir.join("token"))?;
     eprintln!("Runtime Gatekeeper: http://127.0.0.1:{port}/#{token}");
     eprintln!(
         "Foreground daemon; no services auto-start. Stop daemon only after releasing jobs and stopping managed services."
     );
-    for mut req in server.incoming_requests() {
-        let header = |name: &'static str| {
-            req.headers()
-                .iter()
-                .find(|h| h.field.equiv(name))
-                .map(|h| h.value.as_str().to_owned())
-        };
-        let host_ok = header("Host")
-            .is_some_and(|v| v == format!("127.0.0.1:{port}") || v == format!("localhost:{port}"));
-        let origin_ok = header("Origin").is_none_or(|v| {
-            v == format!("http://127.0.0.1:{port}") || v == format!("http://localhost:{port}")
-        });
-        if !host_ok || !origin_ok {
-            respond(req, 403, "text/plain", "Forbidden".into());
-            continue;
-        }
-        let method = req.method().as_str().to_owned();
-        let url = req.url().to_owned();
-        if method == "GET" && url == "/" {
-            respond(
-                req,
-                200,
-                "text/html; charset=utf-8",
-                include_str!("dashboard.html").into(),
-            );
-            continue;
-        }
-        let auth_ok = header("Authorization").is_some_and(|v| v == format!("Bearer {token}"));
-        if !auth_ok {
-            respond(req, 401, "text/plain", "Unauthorized".into());
-            continue;
-        }
-        if method == "GET" && url == "/api/status" {
-            respond(req, 200, "application/json", engine.status().to_string());
-            continue;
-        }
-        if method == "POST" && url == "/rpc" {
-            if !header("Content-Type").is_some_and(|v| v.starts_with("application/json")) {
-                respond(req, 415, "text/plain", "JSON required".into());
-                continue;
-            }
-            let mut body = String::new();
-            let read = req
-                .as_reader()
-                .take(1024 * 1024 + 1)
-                .read_to_string(&mut body);
-            if read.is_err() || body.len() > 1024 * 1024 {
-                respond(
-                    req,
-                    413,
-                    "text/plain",
-                    "Body too large or invalid UTF-8".into(),
-                );
-                continue;
-            }
-            let output = match serde_json::from_str::<Value>(&body) {
-                Ok(v) => protocol::rpc(&mut engine, v),
-                Err(_) => Some(protocol::error(Value::Null, -32700, "Parse error")),
-            };
-            if let Some(v) = output {
-                respond(req, 200, "application/json", v.to_string());
-            } else {
-                respond(req, 204, "application/json", String::new());
-            }
-            continue;
-        }
-        respond(req, 404, "text/plain", "Not found".into());
-    }
+    server::run(server, engine, token, observer_token, port);
     Ok(())
 }
 fn respond(req: tiny_http::Request, code: u16, kind: &str, body: String) {
@@ -141,12 +70,29 @@ fn respond(req: tiny_http::Request, code: u16, kind: &str, body: String) {
         .with_header(Header::from_bytes("Content-Security-Policy","default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'").unwrap());
     let _ = req.respond(response);
 }
-fn bridge(config: model::Config) -> Result<()> {
-    let token = fs::read_to_string(config.state_dir.join("token"))
-        .context("start daemon before MCP client")?;
-    let client = ureq::AgentBuilder::new()
+fn new_token(path: &std::path::Path) -> Result<String> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    Ok(token)
+}
+fn local_client() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .redirects(0)
         .timeout(Duration::from_secs(300))
-        .build();
+        .build()
+}
+fn bridge(config: model::Config, observer: bool) -> Result<()> {
+    let bridge_id = uuid::Uuid::new_v4().to_string();
+    let client = local_client();
+    let credential = if observer { "observer-token" } else { "token" };
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut stdout = std::io::stdout().lock();
@@ -172,9 +118,13 @@ fn bridge(config: model::Config) -> Result<()> {
             }
         };
         let has_id = v.get("id").is_some();
+        let v_id = v.get("id").cloned().unwrap_or(Value::Null);
+        let token = fs::read_to_string(config.state_dir.join(credential))
+            .context("start daemon before MCP client")?;
         let response = client
             .post(&format!("http://127.0.0.1:{}/rpc", config.port))
             .set("Authorization", &format!("Bearer {}", token.trim()))
+            .set("X-Gatekeeper-Bridge", &bridge_id)
             .send_json(v);
         match response {
             Ok(r) => {
@@ -186,7 +136,17 @@ fn bridge(config: model::Config) -> Result<()> {
             }
             Err(e) => {
                 if has_id {
-                    bail!("daemon transport failed: {e}");
+                    writeln!(
+                        stdout,
+                        "{}",
+                        protocol::error(
+                            v_id.clone(),
+                            -32000,
+                            "daemon transport failed; verify status before retrying a mutation"
+                        )
+                    )?;
+                    stdout.flush()?;
+                    eprintln!("daemon transport failed: {e}");
                 }
             }
         }
