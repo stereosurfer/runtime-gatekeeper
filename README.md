@@ -2,38 +2,56 @@
 
 多工 AI 工作站的 runtime registry + supervisor。Agent 宣告需要的服務，daemon 準備環境並回覆 READY 或明確阻擋原因；人類透過簡潔工作台查看 Process → Service → Job → Agent。
 
-發布前驗收結果請見 [RELEASE_REVIEW.md](RELEASE_REVIEW.md)。目前為 experimental MVP；附帶執行檔尚未經 Developer ID 簽章與 Apple 公證，Gatekeeper 評估為 rejected。
+這是 experimental MVP。隨附的 Apple Silicon 執行檔採用 ad hoc 簽章，未經 Developer ID 簽章或 Apple 公證。若 macOS 阻擋執行，可走下方原始碼建置流程。早期發布審查見 [RELEASE_REVIEW.md](RELEASE_REVIEW.md)。
 
 ## 啟動
 
-已於 macOS Apple Silicon 原生編譯與測試。需要 Rust stable（本次 1.98.1）、macOS Command Line Tools；不需要 Node、Python、Docker 或任何模型服務。首次編譯需下載 crates。`Cargo.lock` 固定依賴版本。
+在 Apple Silicon Mac 的專案根目錄，校驗隨附執行檔並檢查範例設定：
 
 ```sh
-cargo build --release --locked
-cargo test --locked
-./target/release/runtime-gatekeeper check runtime.yaml
-./target/release/runtime-gatekeeper serve runtime.yaml
+shasum -a 256 -c bin/SHA256SUMS
+./bin/runtime-gatekeeper check runtime.yaml
 ```
 
-daemon 在前景運行，只監聽 `127.0.0.1:47831`。開啟它在終端顯示的完整網址（含 `#` 後的存取權杖）。設定檔路徑可為絕對路徑；`state_dir` 相對於設定檔，不受呼叫端工作目錄影響。
+初次使用且範例連接埠可用時，執行 `./bin/runtime-gatekeeper serve runtime.yaml`。daemon 在前景監聽 `127.0.0.1:47831`。用瀏覽器開啟終端顯示的完整網址（含 `#` 後的私人存取權杖），確認面板顯示「本機連線正常」。`state_dir` 相對於設定檔所在目錄。
 
 範例只註冊一個內建 `demo-worker`，以及 oMLX / LM Studio / ComfyUI 的唯讀 port 觀察。啟動 daemon **不會自動啟動任何服務**。可以在面板啟動 demo，或透過下列 MCP request 啟動。既有本機 AI 服務不會被修改、切換 provider 或終止。
 
-本次交付另有 `bin/runtime-gatekeeper` 原生 arm64 執行檔，無須先安裝 Rust 即可執行：
+### 已有常駐 daemon 時，從全新目錄試跑
+
+在新取出的專案根目錄建立獨立設定。下例使用空閒的測試埠 47832、獨立狀態目錄及一個觀察用服務名稱。若該埠已使用，改用另一個空閒埠。
 
 ```sh
-./bin/runtime-gatekeeper serve runtime.yaml
+cat > runtime-smoke.yaml <<'YAML'
+port: 47832
+state_dir: target/gatekeeper-smoke
+safety_margin_bytes: 0
+services:
+  sample:
+    mode: discovered
+YAML
+./bin/runtime-gatekeeper check runtime-smoke.yaml
+./bin/runtime-gatekeeper serve runtime-smoke.yaml
 ```
 
-關閉 daemon 前，先完成工作、release 租約，再從面板停止 managed 服務或 cleanup。daemon 終止不會強制殺掉正在執行的工作；重啟後不重新取得舊程序的控制權。
+開啟這個測試 daemon 印出的網址。保持它運行，在另一個終端依 [MCP 指南](docs/AGENT_MCP_GUIDE.md#驗證唯讀觀察) 用同一份 `runtime-smoke.yaml` 驗證 `runtime.observe`。完成後在測試 daemon 的終端按 Ctrl-C。
 
-本機工具鏈已隔離安裝在本次工作的 `work/toolchain`，沒有修改全域 PATH。此工作目錄可用 `./dev.sh test --locked`、`./dev.sh build --release --locked` 重建；移到別處則使用 PATH 上的 Rust。
+### 從原始碼建置
+
+隨附執行檔對應原始碼 `af49e4a`，以 Rust 1.98.1 及 `Cargo.lock` 建置，編譯時將本機來源路徑換成通用路徑。自行建置需安裝 Rust 和 macOS Command Line Tools，在專案根目錄執行：
+
+```sh
+cargo build --release --locked
+./target/release/runtime-gatekeeper check runtime.yaml
+```
+
+採用自行建置版本時，daemon 與 MCP 客戶端都使用 `target/release/runtime-gatekeeper`。
 
 ## macOS 27 相容性
 
 本版保留 Rust daemon、MCP bridge 與 loopback Dashboard 的架構，沒有依賴 macOS 27 專屬 UI 或私有 framework。Apple Silicon 的程序用量由獨立的 macOS platform module 讀取 `phys_footprint`，失敗時退回 RSS；這讓 Metal / IOAccelerator 服務仍能被觀察，也保留較舊 macOS 的相容路徑。
 
-macOS 27 的 launchd 不再載入帶有 `com.apple.quarantine` extended attribute 的 plist。從 GitHub 下載後若要安裝 user LaunchAgent，請先確認檔案來源，再清除該 plist 的 quarantine；本機 `open-panel.sh` 會在載入前檢查並給出指令，不會靜默繞過 Gatekeeper。現有部署可用以下唯讀檢查驗證 launchd、HTTP、token 與 `/api/status`：
+使用本專案部署配置的 user LaunchAgent，可用以下唯讀檢查核對 plist 的 quarantine 屬性、launchd、HTTP、token 與 `/api/status`：
 
 ```sh
 ./scripts/macos-smoke.sh
@@ -47,7 +65,7 @@ Agent 的設定方式、request / release 範本、READY 與阻擋回覆處理�
 
 每個 Agent 啟動輕量 **stdio bridge**，連到同一 daemon。所有 Agent 和 Dashboard 共用同一份序列化狀態與 lease，避免多個 MCP server 各自啟動相同服務。MCP 使用逐行 JSON-RPC；stdout 只有協定訊息，錯誤寫 stderr。
 
-在支援 MCP 的客戶端填入以下設定（替換兩個絕對路徑）：
+需要申請與釋放工單的 MCP 客戶端可用以下設定（替換兩個絕對路徑）。日常唯讀盤點請將第一個參數改成 `mcp-observe`。兩者都使用正在服務的 daemon 所用的設定檔。
 
 ```json
 {
@@ -231,9 +249,9 @@ node tests/dashboard.mjs # 可選 Node.js，僅驗證面板；執行服務不需
 
 隔離驗證使用測試專用設定、state 及閒置 loopback ports，不載入正式 runtime.yaml。正式更新前需確認沒有 READY/INTERRUPTED lease 及 daemon-owned 服務，備份執行檔與設定，才可切換及重啟。不得為了更新自行釋放別人的租約。
 
-## 資源觀察（需由原始碼建置）
+## 資源觀察
 
-隨附的舊執行檔不含 `runtime.observe`。不帶參數時可看系統壓力、Swap、已知與未知預留；指定已登錄的服務可另看程序歸屬。登錄時可為任意服務設定 `queue_source`。指定服務的觀察查詢會由獨立讀取執行緒，以唯讀 GET 讀取經核對實例的佇列數量；讀取忙碌回 `sampler_busy`，無來源回 `no_configured_source`。服務歸屬與實例識別規則見[服務登錄指南](docs/SERVICE_REGISTRATION.md)。觀察不會核發租約，外部工具的圖形記憶體不能再加到程序 footprint。
+隨附的 daemon 和兩種 stdio bridge 都支援 `runtime.observe`。不帶參數時可看系統壓力、Swap、已知與未知預留；指定已登錄的服務可另看程序歸屬。登錄時可為任意服務設定 `queue_source`。指定服務的觀察查詢會由獨立讀取執行緒，以唯讀 GET 讀取經核對實例的佇列數量；讀取忙碌回 `sampler_busy`，無來源回 `no_configured_source`。服務歸屬與實例識別規則見[服務登錄指南](docs/SERVICE_REGISTRATION.md)。觀察不會核發租約，外部工具的圖形記憶體不能再加到程序 footprint。
 
 設定唯讀 MCP 時，將 stdio 指令設為 `runtime-gatekeeper mcp-observe /absolute/path/runtime.yaml`。daemon 以獨立的 observer-token 驗證六項查詢。控制命令沿用原有管理入口。
 
