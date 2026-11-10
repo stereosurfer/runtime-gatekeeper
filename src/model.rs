@@ -28,6 +28,7 @@ pub struct Service {
     pub memory_bytes: Option<u64>,
     #[serde(default)]
     pub http_health_path: Option<String>,
+    pub queue_source: Option<QueueSource>,
     #[serde(default)]
     pub exclusive_group: Option<String>,
     #[serde(default)]
@@ -38,6 +39,43 @@ pub struct Service {
     pub allowed_actions: BTreeSet<String>,
     #[serde(default = "timeout")]
     pub startup_timeout_ms: u64,
+}
+/// A trusted operator declares a read-only HTTP resource on the registered port.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueSource {
+    pub path: String,
+    pub format: QueueFormat,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueFormat {
+    Counts,
+    ComfyQueue,
+}
+
+impl QueueSource {
+    fn valid_path(&self) -> bool {
+        let Some(path) = self.path.strip_prefix('/') else {
+            return false;
+        };
+        if path.is_empty() {
+            return true;
+        }
+        self.path.len() <= 256
+            && path
+                .strip_suffix('/')
+                .unwrap_or(path)
+                .split('/')
+                .all(|part| {
+                    !part.is_empty()
+                        && part != "."
+                        && part != ".."
+                        && part.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+                        })
+                })
+    }
 }
 fn timeout() -> u64 {
     5000
@@ -100,6 +138,12 @@ impl Config {
                         && path.starts_with('/')
                         && !path.chars().any(char::is_whitespace),
                     "http_health_path requires a port and a single HTTP path"
+                );
+            }
+            if let Some(source) = &s.queue_source {
+                ensure!(
+                    s.port.is_some() && source.valid_path(),
+                    "queue_source for {id} requires a registered port and an absolute local path"
                 );
             }
             if let Some(group) = &s.exclusive_group {
@@ -188,6 +232,7 @@ pub struct Process {
     #[serde(skip)]
     pub args: Vec<String>,
     pub ram_bytes: u64,
+    pub memory_basis: String,
     pub cpu_percent: f32,
     pub service: Option<String>,
     pub class: String,
@@ -236,5 +281,43 @@ mod tests {
     fn reject_discovered_control() {
         let c: Config = serde_saphyr::from_str("port: 47831\nstate_dir: .runtime\nsafety_margin_bytes: 0\nservices:\n  external:\n    mode: discovered\n    command: [/bin/sleep, '10']\n").unwrap();
         assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn queue_sources_are_static_local_gets_on_the_registered_port() {
+    let validate = |port: Option<u16>, source: serde_json::Value| -> Result<()> {
+        let input = serde_json::json!({"port":4200,"state_dir":"test","safety_margin_bytes":0,
+            "services":{"demo":{"mode":"discovered","port":port,"queue_source":source}}});
+        serde_json::from_value::<Config>(input)?.validate()
+    };
+    let src = |p: &str| serde_json::json!({"path":p,"format":"counts"});
+    for valid in ["/", "/queue", "/v1/metrics.json", "/v2/queue/"] {
+        validate(Some(4201), src(valid)).unwrap();
+    }
+    for path in [
+        "",
+        "queue",
+        "https://remote/queue",
+        "//remote/queue",
+        "/one/../two",
+        "/%2e%2e/test",
+        "/v1?token=x",
+        "/a#b",
+        "/v1\\queue",
+        "/bad\r\nHeader",
+        "/v1//queue",
+        "//",
+    ] {
+        assert!(validate(Some(4201), src(path)).is_err(), "{path:?}");
+    }
+    assert!(validate(None, src("/queue")).is_err());
+    for extra in [
+        serde_json::json!({"path":"/queue","format":"raw"}),
+        serde_json::json!({"path":"/queue","format":"counts","method":"POST"}),
+        serde_json::json!({"path":"/queue","format":"counts","url":"http://localhost:9000"}),
+    ] {
+        assert!(validate(Some(4201), extra).is_err());
     }
 }

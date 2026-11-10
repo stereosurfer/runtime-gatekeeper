@@ -85,6 +85,7 @@ release 只解除租約，不停止共享服務。若要回收可丟棄的閒置
 | 工具 | 參數 | 行為 |
 |---|---|---|
 | runtime.status | 無 | CPU / RAM / swap / services / jobs / unknown |
+| runtime.observe | service_id? | 讀取主機或指定服務的資源、預留與原生佇列樣本 |
 | runtime.request | job_id, agent, requires, memory_bytes? | 取得工作租約或回傳 BLOCKED |
 | runtime.release | runtime_id | 冪等釋放租約 |
 | services.list | 無 | 全部服務與用量、控制能力 |
@@ -198,9 +199,9 @@ Human ─ Web Dashboard ───┘                      │
 
 ## 已知 MVP 限制
 
-- 系統總量與可用量來自 sysinfo；macOS 准入的零值回退只使用 sysinfo 的空閒頁下界。macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
-- 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、跨工作排程 DAG、輸出目錄準備或持續健康輪詢。服務 `requires` 只在單筆 request 內展開；觀察在 status/request 時刷新，面板每 5 秒刷新。
-- 控制操作序列執行，啟動 health 等待期間面板更新可能延遲。本機 HTTP 未提供抗惡意慢連線的服務品質保證。
+- macOS 主機總量與可用 RAM 分別採自 sysctl 與 Mach；准入讀取 sysinfo，必要時採同次快照的空閒頁下界。macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
+- 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、跨工作排程 DAG、輸出目錄準備。服務相依關係在單筆 request 內展開，面板每 5 秒讀取已發佈的快照。
+- 控制操作由單一 engine 執行；讀取由約每 2 秒更新的快照提供。啟動 health 等待期間快照暫停更新，但面板與唯讀 MCP 仍可回應，並附上取樣時間、年齡與目前控制操作。超過 10 秒或控制忙碌時面板停用控制；准入仍由 engine 重新檢查即時資源。HTTP 尚未提供抗惡意慢連線或長時間不讀取回應的服務品質保證。
 - 不支援服務逃離 process group、root 退出後持續工作的 daemonized 子程序。此類程序退為觀察，需人類處理。macOS PID/start-time 檢查可降低誤殺風險，不能提供 kernel pidfd 等級的無競態保證。
 - JSON state 與 JSONL event 不是單一資料庫 transaction，崩潰時事件可能少最後一筆；損毀 state 會拒絕啟動，不清空租約。寫入失敗會停用後續控制操作，需修復後重啟。events / logs 尚無 rotation。
 - 未自動安裝到 launchd，也未替 Hermes / Codex 寫入 MCP 設定。
@@ -219,3 +220,35 @@ node tests/dashboard.mjs # 可選 Node.js，僅驗證面板；執行服務不需
 整合測試使用獨立暫存目錄與隨機 loopback ports，實際啟停內建 fixture，不觸碰本機 AI 服務。包含：記憶體邊界、discovered 設定拒絕、共享租約、request 冪等、受保護 stop/restart、release/cleanup、外部 port 不接管、部分啟動 rollback、stdio MCP handshake、Host/Origin/token 邊界、daemon 重啟保留租約、健康 timeout、job_id 衝突。
 
 依賴使用 Cargo.lock 固定版本。YAML 解析已改為 serde-saphyr；HTTP bridge 只保留 JSON 功能，sysinfo 只啟用 system。第三方授權清單與上游聲明位於 `third-party/`，其授權不等於本專案授權。
+
+## MCP 診斷與輸出契約
+
+面板顯示 bridge 識別、client 名稱/版本、initialize、tools/list、最近成功工具呼叫與最近結果。這是本次 daemon 啟動後的觀察紀錄，最多保留 64 個 bridge；不是心跳或在線保證，也不能證明另一串對話已曝光工具。未帶 bridge 標頭的舊 client 不會出現在這個清單；重新啟動該 client 的 bridge 後才使用新版診斷。
+
+每個 stdio bridge 獨立存在，斷線不會釋放工作 lease 或停止其他 client 的共用服務。bridge 每次呼叫重新讀取 token，daemon 重啟後可在下次呼叫恢復；傳輸失敗回傳 JSON-RPC error，不自動重送可能已執行的變更。先讀取工作狀態再決定是否重試。Dashboard 在 daemon token 輪替後仍需新的存取網址。
+
+12 個工具提供 object outputSchema 與 structuredContent；業務阻擋仍是成功傳遞的判定，Agent 必須讀 status。錯誤回覆的 isError 與 JSON-RPC errors 不套成功輸出 schema。支援協定版本不變。所有唯讀工具都附 snapshot metadata；它們不是即時准入保證。程序列附 memory_basis：phys_footprint、rss_fallback 或 rss；取樣時間在 snapshot.sampled_at。聚合仍可能重疊，不能反推個別程序 swap。
+
+隔離驗證使用測試專用設定、state 及閒置 loopback ports，不載入正式 runtime.yaml。正式更新前需確認沒有 READY/INTERRUPTED lease 及 daemon-owned 服務，備份執行檔與設定，才可切換及重啟。不得為了更新自行釋放別人的租約。
+
+## 資源觀察（需由原始碼建置）
+
+隨附的舊執行檔不含 `runtime.observe`。不帶參數時可看系統壓力、Swap、已知與未知預留；指定已登錄的服務可另看程序歸屬。登錄時可為任意服務設定 `queue_source`。指定服務的觀察查詢會由獨立讀取執行緒，以唯讀 GET 讀取經核對實例的佇列數量；讀取忙碌回 `sampler_busy`，無來源回 `no_configured_source`。服務歸屬與實例識別規則見[服務登錄指南](docs/SERVICE_REGISTRATION.md)。觀察不會核發租約，外部工具的圖形記憶體不能再加到程序 footprint。
+
+設定唯讀 MCP 時，將 stdio 指令設為 `runtime-gatekeeper mcp-observe /absolute/path/runtime.yaml`。daemon 以獨立的 observer-token 驗證六項查詢。控制命令沿用原有管理入口。
+
+## 同一份主機快照
+
+在 runtime.status 的 `resources.system`、runtime.observe 的 `system` 和面板上比對 CPU、RAM、swap 時，先比對 `snapshot.id`。每次發佈新取樣都會產生新 ID；同一份樣本的 `sampled_at` 固定，`age_ms` 隨讀取時間增加。來源、單位、原值及可用性保存在每項量測中。定向查詢的原生佇列有自己的取樣時間。
+
+`memory.available` 與 `available_basis` 保留准入採用的值及來源。主機量測在 `resources.system.available`，與 observe 和面板共用；macOS 核心讀值失敗時標示未取得。
+
+`resources.process_accounting`（observe 中為 `process_accounting`）分列已歸屬、未歸屬和全部程序的筆數、未量得 RAM 的筆數及已量得的 bytes 小計。確實空的清單其小計為零；非空但全數讀不到時為 null。部分讀取成功會保留已知小計，同時揭露缺幾個程序。單一服務顯示完整合計，有缺值就顯示未取得。程序加總與系統已用量口徑不同。observe 保留未歸屬程序的前五筆，總量仍涵蓋本次整份清單。
+
+macOS 觀察取樣直接檢查 Mach、sysctl 與程序計數器讀取結果。主機 CPU 是整機忙碌比例；程序 CPU 是單核心百分比，可高於 100%。首次取樣、程序換實例或缺計數器基線時，CPU 回報未取得。有效的兩筆讀數沒有增加，才得到 0%。程序記憶體保留 phys_footprint／RSS 回退的來源。超過 10 秒的樣本標過期；控制執行中則保留忙碌原因與前次樣本的時間。
+
+`tests/snapshot_dashboard.py` 使用 Rust 測試執行檔中的固定採樣器、正式 stdio bridge、HTTP 路由和背景 Chrome 驗證面板。`--live` 另外使用零登錄服務的獨立 daemon，從三個入口比對同一筆實際 Mac 快照。
+
+## 工單採樣收據
+
+可用[離線收據工具](docs/SAMPLE_RECEIPTS.md)把執行器的 attempt 與原生工作 ID 對上基線、執行中服務 footprint 的採樣峰值、結束樣本與終態。收據分開記錄證據來源、缺樣及歸屬範圍。

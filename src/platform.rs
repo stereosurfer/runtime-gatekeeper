@@ -1,4 +1,5 @@
 //! Small operating-system adapters kept outside the runtime engine.
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     process::Command,
@@ -34,6 +35,92 @@ pub fn listening_pids() -> Option<BTreeMap<u16, BTreeSet<u32>>> {
     Some(result)
 }
 
+/// Match the listener to the registered process inventory and distinguish PID reuse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInstance {
+    pub pid: u32,
+    pub start_time: u64,
+    pub birth_marker: u64,
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_instance(pid: u32) -> Option<ProcessInstance> {
+    use std::mem::{MaybeUninit, size_of};
+    let mut out = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid.try_into().ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            out.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    let info = unsafe { out.assume_init() };
+    if info.pbi_pid != pid || info.pbi_start_tvsec == 0 {
+        return None;
+    }
+    Some(ProcessInstance {
+        pid,
+        start_time: info.pbi_start_tvsec,
+        birth_marker: info.pbi_start_tvusec,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_instance(_: u32) -> Option<ProcessInstance> {
+    None
+}
+
+/// Bound lookup time as well as network I/O. Require a unique visible TCP listener.
+pub fn current_listener(port: u16) -> Option<ProcessInstance> {
+    use std::{
+        io::Read,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let mut child = Command::new("lsof")
+        .args(["-nP", "-a", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_millis(800);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    child
+        .stdout
+        .take()?
+        .take(4097)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > 4096 {
+        return None;
+    }
+    let mut owners = text.lines().filter_map(|line| line.strip_prefix('p'));
+    let pid = owners.next()?.parse().ok()?;
+    if owners.next().is_some() {
+        return None;
+    }
+    process_instance(pid)
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn proc_pid_rusage(
@@ -49,15 +136,18 @@ unsafe extern "C" {
 /// which is important for Metal-backed applications such as Draw Things and
 /// ComfyUI. The v4 layout is retained for compatibility with older supported
 /// macOS releases; failures intentionally fall back to sysinfo's RSS value.
-pub fn measured_memory(pid: u32, resident_bytes: u64) -> u64 {
+pub fn measured_memory(pid: u32, resident_bytes: u64) -> (u64, &'static str) {
     #[cfg(target_os = "macos")]
     {
-        macos_phys_footprint(pid).unwrap_or(resident_bytes)
+        macos_phys_footprint(pid)
+            .filter(|&n| n > 0 || resident_bytes == 0)
+            .map(|n| (n, "phys_footprint"))
+            .unwrap_or((resident_bytes, "rss_fallback"))
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = pid;
-        resident_bytes
+        (resident_bytes, "rss")
     }
 }
 
@@ -109,7 +199,7 @@ fn macos_phys_footprint(pid: u32) -> Option<u64> {
         .try_into()
         .ok()?;
     let footprint = u64::from_ne_bytes(bytes);
-    (footprint > 0).then_some(footprint)
+    Some(footprint)
 }
 
 #[cfg(test)]

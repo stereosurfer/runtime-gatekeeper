@@ -22,6 +22,10 @@ const context=vm.createContext({console,Set,Date,JSON,Error,location:{hash:'',pa
 }});
 vm.runInContext(script,context);await new Promise(setImmediate);
 assert.equal(nodes.get('cleanup').disabled,false,'online controls enabled');
+assert.match(nodes.get('memory-note').textContent,/系統記憶體壓力：未取得/);
+snapshot.memory.pressure='warning';await vm.runInContext('refresh()',context);
+assert.match(nodes.get('memory-note').textContent,/系統記憶體壓力：警告/);
+assert.equal(calls,0,'pressure cannot trigger a service action');
 let resolve;hold={promise:new Promise(r=>resolve=r)};
 const one=vm.runInContext("action('services.start',{service_id:'demo'})",context);
 await new Promise(setImmediate);
@@ -40,4 +44,7 @@ const before=calls;await vm.runInContext("action('runtime.cleanup',{})",context)
 statusFail=false;snapshot.storage_failed=true;await vm.runInContext('refresh()',context);
 assert.equal(nodes.get('cleanup').disabled,true,'storage fault disables controls even while online');
 snapshot.storage_failed=false;await vm.runInContext('refresh()',context);assert.equal(nodes.get('cleanup').disabled,false);assert.match(nodes.get('notice').textContent,/已連線/,'successful reconnect clears obsolete fault message');
-console.log('PASS: pending/duplicate, cleanup failure, offline, expired token, storage fault, reconnect UI behavior');
+snapshot.read_only=true;await vm.runInContext('refresh()',context);
+assert.equal(nodes.get('cleanup').disabled,true,'observer cannot invoke controls');
+const observed=calls;await vm.runInContext("action('runtime.cleanup',{})",context);assert.equal(calls,observed);
+console.log('PASS: observer read-only controls, pending/duplicate, cleanup failure, offline, expired token, storage fault, reconnect UI behavior');
