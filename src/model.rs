@@ -119,7 +119,7 @@ impl Config {
             }
         }
         for id in self.services.keys() {
-            self.expand_requires(&[id.clone()])?;
+            self.expand_requires(std::slice::from_ref(id))?;
         }
         Ok(())
     }

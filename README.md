@@ -148,6 +148,8 @@ available = max(OS available - safety_margin - outstanding, 0)
 shortfall = max(required - available, 0)
 ```
 
+macOS 上若 sysinfo 的 `available_memory()` 因壓縮頁扣除而飽和為 0，准入改用同次系統快照的 `free_memory()` 作保守下界；它只計真正空閒的實體頁，不把 inactive／purgeable 頁或記憶體壓力百分比換算成可用 bytes。兩者皆為 0 時仍阻擋，且安全保留量與既有工作估計照常扣除。`runtime.status` 與記憶體阻擋回覆會列出 `available_basis`、原始 `sysinfo_available` 與 `free_memory`，方便追查判定來源。這仍可能錯拒可運行的工作；任何 READY 都不是 OS 保留記憶體的保證。
+
 `memory_bytes` 是**額外工作需求**，不是包括共享服務在內的總 RAM。未填值保持 `null`，回覆的 `memory_assurance: unknown` 與 `unmeasured_job_memory: true` 明示容量未知；即使其他條件得到 READY，也不能將 0 當作量測結果。未量測的 managed 服務啟動會以 `unknown_service_startup_memory` 阻擋。運行中的共享服務不重複計算啟動 RAM。現有已量測 job 額外需求持續保守扣除至 release。這是簡單 admission accounting，沒有排程、優先權、資源搶占或 OS 記憶體保留；外部程序仍可能在 READY 後消耗 RAM。
 
 ```json
@@ -196,7 +198,7 @@ Human ─ Web Dashboard ───┘                      │
 
 ## 已知 MVP 限制
 
-- 系統總量與可用量來自 sysinfo；macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
+- 系統總量與可用量來自 sysinfo；macOS 准入的零值回退只使用 sysinfo 的空閒頁下界。macOS 程序用量優先讀 `phys_footprint`，包含 Metal / IOAccelerator 圖形記憶體，讀取失敗時退回 RSS。程序 footprint 聚合仍可能因共享資源重疊而高於系統已用 RAM，也不能推論 per-process swap。CPU 是兩次更新的差值，第一次不代表穩態。
 - 無 GPU / SMC、歷史圖表、多機、scheduler、自動回收排程、自動犧牲工作、模型載入驗證、跨工作排程 DAG、輸出目錄準備或持續健康輪詢。服務 `requires` 只在單筆 request 內展開；觀察在 status/request 時刷新，面板每 5 秒刷新。
 - 控制操作序列執行，啟動 health 等待期間面板更新可能延遲。本機 HTTP 未提供抗惡意慢連線的服務品質保證。
 - 不支援服務逃離 process group、root 退出後持續工作的 daemonized 子程序。此類程序退為觀察，需人類處理。macOS PID/start-time 檢查可降低誤殺風險，不能提供 kernel pidfd 等級的無競態保證。

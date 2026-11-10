@@ -1,5 +1,7 @@
 use crate::model::*;
-use crate::platform::{listening_pids, measured_memory, process_memory_basis};
+use crate::platform::{
+    admission_available_memory, listening_pids, measured_memory, process_memory_basis,
+};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -234,7 +236,7 @@ impl Engine {
             let state=if running {"running"} else if port_reachable || !ps.is_empty() {"unhealthy"} else {"stopped"};
             let mut actions=Vec::new();
             if s.mode==Mode::Managed && class=="managed" && leases.is_empty() {
-                for a in &s.allowed_actions { if (a=="start" && !running) || (a!="start" && self.owned.contains_key(id)) { actions.push(a); } }
+                for a in &s.allowed_actions { if (a=="start" && !running && !port_reachable) || (a!="start" && self.owned.contains_key(id)) { actions.push(a); } }
             }
             json!({"id":id,"class":class,"configured_mode":s.mode,"state":state,"healthy":healthy,"identity_verified":identity_verified,"ownership_probe_available":listeners.is_some(),"http_health_path":s.http_health_path,"exclusive_group":s.exclusive_group,"requires":s.requires,"port":s.port,"ram_bytes":ps.iter().map(|p|p.ram_bytes).sum::<u64>(),"cpu_percent":ps.iter().map(|p|p.cpu_percent).sum::<f32>(),"memory_estimate_bytes":s.memory_bytes,"disposable":s.disposable,"leases":leases,"processes":ps,"actions":actions})
         }).collect()
@@ -246,7 +248,9 @@ impl Engine {
         let unknown_processes: Vec<_> = ps.iter().filter(|p| p.service.is_none()).collect();
         let unknown_process_ram = unknown_processes.iter().map(|p| p.ram_bytes).sum::<u64>();
         let system_unaccounted = self.system.used_memory().saturating_sub(process_total);
-        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"total":self.system.total_memory(),"used":self.system.used_memory(),"available":self.system.available_memory(),"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted,"process_basis":process_memory_basis()},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
+        let (admission_available, available_basis) =
+            admission_available_memory(self.system.available_memory(), self.system.free_memory());
+        json!({"name":"Runtime Gatekeeper","storage_failed":self.storage_failed.get(),"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"memory":{"total":self.system.total_memory(),"used":self.system.used_memory(),"available":admission_available,"sysinfo_available":self.system.available_memory(),"free_memory":self.system.free_memory(),"available_basis":available_basis,"swap_used":self.system.used_swap(),"swap_total":self.system.total_swap(),"safety_margin":self.config.safety_margin_bytes,"process_total":process_total,"unknown_process_ram":unknown_process_ram,"system_unaccounted":system_unaccounted,"process_basis":process_memory_basis()},"cpu_percent":self.system.global_cpu_usage(),"services":self.views(&ps),"jobs":self.state.jobs.values().collect::<Vec<_>>(),"unknown":unknown_processes})
     }
     fn action_allowed(&self, id: &str, action: &str) -> Result<Service> {
         let s = self.config.services.get(id).context("unknown service")?;
@@ -433,9 +437,11 @@ impl Engine {
                             .saturating_sub(v["ram_bytes"].as_u64().unwrap_or(0)),
                     )
                 });
+        let (admission_available, available_basis) =
+            admission_available_memory(self.system.available_memory(), self.system.free_memory());
         let g = memory_gate(
             required,
-            self.system.available_memory(),
+            admission_available,
             self.config.safety_margin_bytes,
             outstanding.saturating_add(service_pending),
         );
@@ -454,7 +460,7 @@ impl Engine {
             .iter()
             .filter(|v| v["state"] != "stopped" && !reclaimable.iter().any(|r| r["id"] == v["id"]))
             .collect();
-        json!({"status":g.status,"resource":"memory","units":"bytes","required":g.required,"available":g.available,"shortfall":g.shortfall,"observed_available":self.system.available_memory(),"safety_margin":self.config.safety_margin_bytes,"outstanding_estimates":outstanding.saturating_add(service_pending),"reclaimable":reclaimable,"protected":protected})
+        json!({"status":g.status,"resource":"memory","units":"bytes","required":g.required,"available":g.available,"shortfall":g.shortfall,"observed_available":admission_available,"sysinfo_available":self.system.available_memory(),"free_memory":self.system.free_memory(),"available_basis":available_basis,"safety_margin":self.config.safety_margin_bytes,"outstanding_estimates":outstanding.saturating_add(service_pending),"reclaimable":reclaimable,"protected":protected})
     }
     fn exclusive_conflicts(&self, requested: &[String]) -> Vec<Value> {
         let groups: BTreeSet<_> = requested
