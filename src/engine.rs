@@ -707,3 +707,111 @@ impl Engine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOLDER: &str = "engine::tests::memory_holder_fixture";
+
+    /// Child fixture: hold touched memory so its kernel exit teardown is long
+    /// enough to observe, the way a model server's is.
+    #[test]
+    #[ignore = "spawned by stop_reaps_a_root_whose_exit_teardown_hides_it_from_sysinfo"]
+    fn memory_holder_fixture() {
+        let Ok(mb) = std::env::var("RG_TEST_HOLD_MB") else {
+            return;
+        };
+        let mut held = vec![0u8; mb.parse::<usize>().unwrap() << 20];
+        for page in held.chunks_mut(16384) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&held);
+        std::thread::sleep(Duration::from_secs(600));
+    }
+
+    fn engine(dir: &std::path::Path, services: &str) -> Engine {
+        let yaml = format!(
+            "port: 1\nstate_dir: {}\nsafety_margin_bytes: 0\nservices:\n{services}",
+            dir.join("state").display()
+        );
+        Engine::new(serde_saphyr::from_str(&yaml).unwrap()).unwrap()
+    }
+
+    /// What `ps` reports as STAT Z: our child exited but the engine never
+    /// reaped it. A dropped child may still be tearing down, so wait for it to
+    /// become collectable. Reaping it here keeps a failed run from leaking.
+    fn leaked_zombie(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) } {
+                0 => {
+                    assert!(Instant::now() < deadline, "PID {pid} is still running");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                reaped => return reaped == pid as i32,
+            }
+        }
+    }
+
+    fn start_holder(e: &mut Engine) -> u32 {
+        e.start("holder").unwrap();
+        let pid = e.owned["holder"].child.id();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            e.system.refresh_all();
+            let rss = e.system.process(Pid::from_u32(pid)).map_or(0, |p| p.memory());
+            if rss >= 1900 << 20 {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "fixture never reached its size");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn holder_engine(dir: &std::path::Path) -> Engine {
+        let exe = std::env::current_exe().unwrap();
+        engine(
+            dir,
+            &format!(
+                "  holder:\n    mode: managed\n    command: [/usr/bin/env, RG_TEST_HOLD_MB=2048, '{}', --ignored, --exact, {HOLDER}, --test-threads=1]\n    allowed_actions: [start, stop]\n",
+                exe.display()
+            ),
+        )
+    }
+
+    #[test]
+    fn stop_reaps_a_root_whose_exit_teardown_hides_it_from_sysinfo() {
+        // Between SIGTERM and the moment waitpid can collect it, an exiting
+        // process is already invisible to proc_pidinfo (and so to sysinfo).
+        // That window grows with resident memory. A stop that trusts the
+        // process table there drops the Child handle unreaped: a zombie.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = holder_engine(dir.path());
+        for round in 0..24 {
+            let pid = start_holder(&mut e);
+            e.stop_owned("holder").unwrap();
+            assert!(!e.owned.contains_key("holder"));
+            assert!(!leaked_zombie(pid), "round {round}: stop left PID {pid} as a zombie");
+        }
+    }
+
+    #[test]
+    fn refresh_lets_go_of_an_exited_root_only_after_reaping_it() {
+        // Same window when the service dies on its own (crash, external kill):
+        // a status refresh must not forget the child before waitpid has it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = holder_engine(dir.path());
+        for round in 0..24 {
+            let pid = start_holder(&mut e);
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while e.owned.contains_key("holder") {
+                assert!(Instant::now() < deadline, "round {round}: exited root never released");
+                e.refresh();
+            }
+            assert!(!leaked_zombie(pid), "round {round}: refresh left PID {pid} as a zombie");
+        }
+    }
+}
