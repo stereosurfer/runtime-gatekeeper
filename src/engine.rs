@@ -20,9 +20,10 @@ use std::{
 };
 use sysinfo::{Pid, System};
 
+/// An unreaped child keeps its PID, so waitpid alone decides when it is gone.
+/// Dropping a `Child` does not reap it; drop only after `try_wait` collects it.
 struct Owned {
     child: Child,
-    start_time: u64,
 }
 pub struct Engine {
     pub config: Config,
@@ -133,13 +134,16 @@ impl Engine {
     }
     fn refresh(&mut self) {
         self.system.refresh_all();
-        self.owned.retain(|_, o| {
-            o.child.try_wait().ok().flatten().is_none()
-                && self
-                    .system
-                    .process(Pid::from_u32(o.child.id()))
-                    .is_some_and(|p| p.start_time() == o.start_time)
-        });
+        // The process table loses an exiting child before waitpid can collect
+        // it; letting go of the handle there would leave a zombie.
+        self.owned
+            .retain(|_, o| matches!(o.child.try_wait(), Ok(None)));
+    }
+    /// True once the owned root is reaped (or no longer ours to reap).
+    fn root_reaped(&mut self, id: &str) -> bool {
+        self.owned
+            .get_mut(id)
+            .is_none_or(|o| !matches!(o.child.try_wait(), Ok(None)))
     }
     fn leases(&self, id: &str) -> Vec<Value> {
         self.state.jobs.values().filter(|j| ["READY","INTERRUPTED"].contains(&j.status.as_str()) && j.request.requires.iter().any(|s| s==id))
@@ -312,17 +316,11 @@ impl Engine {
         }
         self.persist("service_start_intent", json!({"service":id}))?;
         let mut child = command.spawn().context("service spawn failed")?;
-        self.system.refresh_all();
-        let Some(start_time) = self
-            .system
-            .process(Pid::from_u32(child.id()))
-            .map(|p| p.start_time())
-        else {
-            let _ = child.kill();
+        if !matches!(child.try_wait(), Ok(None)) {
             let _ = child.wait();
             bail!("service exited before ownership registration");
-        };
-        self.owned.insert(id.into(), Owned { child, start_time });
+        }
+        self.owned.insert(id.into(), Owned { child });
         let deadline = Instant::now() + Duration::from_millis(s.startup_timeout_ms);
         loop {
             std::thread::sleep(Duration::from_millis(100));
@@ -375,56 +373,68 @@ impl Engine {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             self.system.refresh_all();
-            if let Some(o) = self.owned.get_mut(id) {
-                let _ = o.child.try_wait();
-            }
-            let alive: Vec<_> = members
-                .iter()
-                .filter(|(p, t)| {
-                    self.system
-                        .process(Pid::from_u32(*p))
-                        .is_some_and(|s| s.start_time() == *t)
-                })
-                .copied()
-                .collect();
-            if alive.is_empty() {
+            // waitpid, not the process table, decides whether the root is gone.
+            if self.root_reaped(id) && self.group_survivors(&members, pid).is_empty() {
                 self.owned.remove(id);
                 self.persist("service_stopped", json!({"service":id}))?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                for (p, t) in &alive {
+                if let Some(o) = self.owned.get_mut(id) {
+                    // Unreaped, so the PID is still this child: safe to signal.
+                    let _ = o.child.kill();
+                }
+                for (p, t) in self.group_survivors(&members, pid) {
                     // Revalidate identity and process group immediately before each signal.
                     self.system.refresh_all();
                     if self
                         .system
-                        .process(Pid::from_u32(*p))
-                        .is_some_and(|s| s.start_time() == *t)
-                        && unsafe { libc::getpgid(*p as i32) } == pid as i32
+                        .process(Pid::from_u32(p))
+                        .is_some_and(|s| s.start_time() == t)
+                        && unsafe { libc::getpgid(p as i32) } == pid as i32
                     {
                         unsafe {
-                            libc::kill(*p as i32, libc::SIGKILL);
+                            libc::kill(p as i32, libc::SIGKILL);
                         };
                     }
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                if let Some(o) = self.owned.get_mut(id) {
-                    let _ = o.child.try_wait();
+                // A killed root still needs its kernel teardown (longer with more
+                // resident memory) before waitpid can collect it.
+                let reap_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    self.system.refresh_all();
+                    let reaped = self.root_reaped(id);
+                    let survivors = self.group_survivors(&members, pid);
+                    if reaped && survivors.is_empty() {
+                        break;
+                    }
+                    // Ownership stays registered so a later refresh still reaps the root.
+                    ensure!(
+                        Instant::now() < reap_deadline,
+                        "STOP_INCOMPLETE: inspect remaining processes"
+                    );
                 }
-                self.system.refresh_all();
-                ensure!(
-                    !alive.iter().any(|(p, t)| self
-                        .system
-                        .process(Pid::from_u32(*p))
-                        .is_some_and(|s| s.start_time() == *t)),
-                    "STOP_INCOMPLETE: inspect remaining processes"
-                );
                 self.owned.remove(id);
                 self.persist("service_stopped", json!({"service":id,"escalated":true}))?;
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+    /// Recorded group members other than the root that the last refresh still saw.
+    fn group_survivors(&self, members: &[(u32, u64)], root: u32) -> Vec<(u32, u64)> {
+        members
+            .iter()
+            .filter(|(p, t)| {
+                *p != root
+                    && self
+                        .system
+                        .process(Pid::from_u32(*p))
+                        .is_some_and(|s| s.start_time() == *t)
+            })
+            .copied()
+            .collect()
     }
     fn gate(&self, required: u64, views: &[Value]) -> Value {
         // Outstanding estimates conservatively cover not-yet-materialized job memory.
@@ -704,6 +714,164 @@ impl Engine {
                 Ok(json!({"status":"OK","service_id":id,"action":action}))
             }
             _ => bail!("unknown tool: {name}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOLDER: &str = "engine::tests::memory_holder_fixture";
+
+    /// Child fixture: hold touched memory so its kernel exit teardown is long
+    /// enough to observe, the way a model server's is.
+    #[test]
+    #[ignore = "spawned by stop_reaps_a_root_whose_exit_teardown_hides_it_from_sysinfo"]
+    fn memory_holder_fixture() {
+        let Ok(mb) = std::env::var("RG_TEST_HOLD_MB") else {
+            return;
+        };
+        let mut held = vec![0u8; mb.parse::<usize>().unwrap() << 20];
+        for page in held.chunks_mut(16384) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&held);
+        std::thread::sleep(Duration::from_secs(600));
+    }
+
+    fn engine(dir: &std::path::Path, services: &str) -> Engine {
+        let yaml = format!(
+            "port: 1\nstate_dir: {}\nsafety_margin_bytes: 0\nservices:\n{services}",
+            dir.join("state").display()
+        );
+        Engine::new(serde_saphyr::from_str(&yaml).unwrap()).unwrap()
+    }
+
+    /// What `ps` reports as STAT Z: our child exited but the engine never
+    /// reaped it. A dropped child may still be tearing down, so wait for it to
+    /// become collectable. Reaping it here keeps a failed run from leaking.
+    fn leaked_zombie(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) } {
+                0 => {
+                    assert!(Instant::now() < deadline, "PID {pid} is still running");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                reaped => return reaped == pid as i32,
+            }
+        }
+    }
+
+    fn start_holder(e: &mut Engine) -> u32 {
+        e.start("holder").unwrap();
+        let pid = e.owned["holder"].child.id();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            e.system.refresh_all();
+            let rss = e
+                .system
+                .process(Pid::from_u32(pid))
+                .map_or(0, |p| p.memory());
+            if rss >= 1900 << 20 {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "fixture never reached its size");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn holder_engine(dir: &std::path::Path) -> Engine {
+        let exe = std::env::current_exe().unwrap();
+        engine(
+            dir,
+            &format!(
+                "  holder:\n    mode: managed\n    command: [/usr/bin/env, RG_TEST_HOLD_MB=2048, '{}', --ignored, --exact, {HOLDER}, --test-threads=1]\n    allowed_actions: [start, stop]\n",
+                exe.display()
+            ),
+        )
+    }
+
+    #[test]
+    fn stop_reaps_a_root_whose_exit_teardown_hides_it_from_sysinfo() {
+        // Between SIGTERM and the moment waitpid can collect it, an exiting
+        // process is already invisible to proc_pidinfo (and so to sysinfo).
+        // That window grows with resident memory. A stop that trusts the
+        // process table there drops the Child handle unreaped: a zombie.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = holder_engine(dir.path());
+        for round in 0..24 {
+            let pid = start_holder(&mut e);
+            e.stop_owned("holder").unwrap();
+            assert!(!e.owned.contains_key("holder"));
+            assert!(
+                !leaked_zombie(pid),
+                "round {round}: stop left PID {pid} as a zombie"
+            );
+        }
+    }
+
+    #[test]
+    fn escalated_stop_kills_the_group_and_reaps_the_root() {
+        // Root and its worker ignore SIGTERM, so stop must escalate to SIGKILL
+        // and still collect the root before letting go of it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine(
+            dir.path(),
+            "  stubborn:\n    mode: managed\n    command: [/bin/sh, -c, 'trap \"\" TERM; /bin/sleep 60 & wait']\n    allowed_actions: [start, stop]\n",
+        );
+        e.start("stubborn").unwrap();
+        let pid = e.owned["stubborn"].child.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let worker = loop {
+            e.system.refresh_all();
+            let worker = e.system.processes().iter().find_map(|(p, s)| {
+                (s.parent() == Some(Pid::from_u32(pid))).then(|| (p.as_u32(), s.start_time()))
+            });
+            if let Some(worker) = worker {
+                break worker;
+            }
+            assert!(Instant::now() < deadline, "worker never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        e.stop_owned("stubborn").unwrap();
+        assert!(!e.owned.contains_key("stubborn"));
+        assert!(
+            !leaked_zombie(pid),
+            "escalated stop left PID {pid} as a zombie"
+        );
+        e.system.refresh_all();
+        assert!(
+            !e.system
+                .process(Pid::from_u32(worker.0))
+                .is_some_and(|s| s.start_time() == worker.1),
+            "worker survived the escalated stop"
+        );
+    }
+
+    #[test]
+    fn refresh_lets_go_of_an_exited_root_only_after_reaping_it() {
+        // Same window when the service dies on its own (crash, external kill):
+        // a status refresh must not forget the child before waitpid has it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = holder_engine(dir.path());
+        for round in 0..24 {
+            let pid = start_holder(&mut e);
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while e.owned.contains_key("holder") {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: exited root never released"
+                );
+                e.refresh();
+            }
+            assert!(
+                !leaked_zombie(pid),
+                "round {round}: refresh left PID {pid} as a zombie"
+            );
         }
     }
 }
